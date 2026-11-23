@@ -1,0 +1,247 @@
+name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Kernel git URL (default: N0Kernel pipa for AOSP)'
+        required: true
+        default: 'https://github.com/CuriousNom/n0_kernel_pipa.git'
+      kernel_branch:
+        description: 'Branch name (leave empty for repo default branch)'
+        required: false
+        default: ''
+      defconfig:
+        description: 'Defconfig path (leave empty to auto-detect pipa defconfig)'
+        required: false
+        default: ''
+      enable_susfs:
+        description: 'Apply SUSFS v2.x non-GKI 4.19 backport patches'
+        type: boolean
+        default: true
+      hook_mode:
+        description: 'KSU hook method (do not mix both)'
+        type: choice
+        default: 'arm64_branch_link'
+        options:
+          - arm64_branch_link
+          - susfs_inline
+      fail_on_patch_reject:
+        description: 'Stop immediately if susfs_patch_to_4.19.patch has .rej conflicts'
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev \
+            libelf-dev cpio zip unzip curl wget git python-is-python3 patch \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Download Proton Clang toolchain
+        run: |
+          mkdir -p "$HOME/clang"
+          wget -q "https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.tar.gz" -O clang.tar.gz
+          tar -xzf clang.tar.gz -C "$HOME/clang" --strip-components=1
+          rm -f clang.tar.gz
+
+      - name: Clone kernel source
+        run: |
+          if [ -n "${{ inputs.kernel_branch }}" ]; then
+            git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
+          else
+            git clone --depth=1 "${{ inputs.kernel_repo }}" kernel
+          fi
+
+      - name: Integrate SukiSU Nova (builtin branch)
+        working-directory: kernel
+        run: |
+          rm -rf KernelSU drivers/kernelsu
+          curl -LSs "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh" | bash -s builtin
+
+      - name: Apply SUSFS 4.19 non-GKI backport patches
+        if: ${{ inputs.enable_susfs }}
+        working-directory: kernel
+        run: |
+          PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches"
+
+          echo "[+] Downloading susfs_patch_to_4.19.patch..."
+          curl -fLSs "${PATCH_BASE}/Patch/susfs_patch_to_4.19.patch" -o susfs_patch_to_4.19.patch
+
+          echo "[+] Applying SUSFS 4.19 kernel patch..."
+          set +e
+          patch -p1 --fuzz=3 --forward < susfs_patch_to_4.19.patch
+          PATCH_RC=$?
+          set -e
+          rm -f susfs_patch_to_4.19.patch
+
+          REJ_FILES=$(find . -name "*.rej")
+          if [ -n "$REJ_FILES" ]; then
+            echo "::warning::Patch produced reject (.rej) files:"
+            echo "$REJ_FILES"
+            mkdir -p ../patch-rejects
+            for f in $REJ_FILES; do
+              cp --parents "$f" ../patch-rejects/
+              orig="${f%.rej}"
+              [ -f "$orig" ] && cp --parents "$orig" ../patch-rejects/
+            done
+            echo "HAS_REJECTS=true" >> "$GITHUB_ENV"
+            if [ "${{ inputs.fail_on_patch_reject }}" = "true" ]; then
+              echo "::error::Stopping due to patch rejects. Download the 'susfs-patch-rejects' artifact to resolve them."
+              exit 1
+            fi
+          elif [ "$PATCH_RC" -ne 0 ]; then
+            echo "::error::patch exited with code $PATCH_RC without .rej files."
+            exit "$PATCH_RC"
+          fi
+
+          if [ "${{ inputs.hook_mode }}" = "susfs_inline" ]; then
+            echo "[+] Applying SUSFS inline hook script..."
+            curl -fLSs "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o susfs_inline_hook_patches.sh
+            bash susfs_inline_hook_patches.sh
+            rm -f susfs_inline_hook_patches.sh
+          fi
+
+          echo "[+] Verifying SUSFS source files exist..."
+          ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+
+      - name: Upload patch rejects (on conflict)
+        if: failure() && env.HAS_REJECTS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-patch-rejects
+          path: patch-rejects/
+
+      - name: Locate pipa defconfig and inject SukiSU Nova + SUSFS + KPM flags
+        working-directory: kernel
+        run: |
+          DEFCONFIG="${{ inputs.defconfig }}"
+          if [ -z "$DEFCONFIG" ]; then
+            if [ -f "arch/arm64/configs/vendor/pipa_defconfig" ]; then
+              DEFCONFIG="vendor/pipa_defconfig"
+            elif [ -f "arch/arm64/configs/pipa_defconfig" ]; then
+              DEFCONFIG="pipa_defconfig"
+            else
+              echo "Could not auto-detect pipa defconfig. Available matches:"
+              find arch/arm64/configs -iname "*pipa*"
+              exit 1
+            fi
+          fi
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+
+          CFG_FILE="arch/arm64/configs/$DEFCONFIG"
+          cat << 'EOF' >> "$CFG_FILE"
+
+          # SukiSU Nova (4.19 ARM64 builtin + KPM)
+          CONFIG_KSU=y
+          CONFIG_KPM=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_OVERLAY_FS=y
+          EOF
+
+          if [ "${{ inputs.hook_mode }}" = "arm64_branch_link" ]; then
+            echo "CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y" >> "$CFG_FILE"
+          fi
+
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            cat << 'EOF' >> "$CFG_FILE"
+
+          # SUSFS v2.x options
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
+          EOF
+          fi
+
+      - name: Compile kernel (Image + dtbs)
+        working-directory: kernel
+        run: |
+          export PATH="$HOME/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            STRIP=llvm-strip
+            LLVM=1
+            LLVM_IAS=1
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          )
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          echo "[+] Auditing active KSU & SUSFS flags in out/.config:"
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS)" out/.config | tee ../config-audit.txt || true
+
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image dtbs
+
+      - name: Package AnyKernel3 zip (without dtbo.img)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/README.md AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
+
+          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          if find kernel/out/arch/arm64/boot/dts -name '*.dtb' | grep -q .; then
+            find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > AnyKernel3/dtb
+          fi
+
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=SukiSU-Nova-SUSFS-pipa
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=pipa
+          device.name2=pipa_pad_cn
+          device.name3=23043RP34G
+          supported.versions=13-16
+          supported.patchlevels=
+          '; }
+
+          BLOCK=auto;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          cd AnyKernel3
+          ZIP_NAME="SukiSU-Nova-SUSFS-pipa-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP_NAME" ./*
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload AnyKernel3 artifact and config audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: SukiSU-Nova-SUSFS-pipa-AnyKernel3
+          path: |
+            ${{ env.ZIP_NAME }}
+            config-audit.txt
