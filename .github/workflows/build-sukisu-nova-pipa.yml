@@ -1,16 +1,16 @@
-name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa)
+name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa r1)
 
 on:
   workflow_dispatch:
     inputs:
       kernel_repo:
-        description: 'Kernel git URL (default: N0Kernel pipa for AOSP)'
+        description: 'Kernel git URL'
         required: true
         default: 'https://github.com/CuriousNom/n0_kernel_pipa.git'
       kernel_branch:
-        description: 'Branch name (leave empty for repo default branch)'
+        description: 'Branch or tag name (pinned to r1)'
         required: false
-        default: ''
+        default: 'r1'
       defconfig:
         description: 'Defconfig path (leave empty to auto-detect pipa defconfig)'
         required: false
@@ -49,13 +49,14 @@ jobs:
           tar -xzf clang.tar.gz -C "$HOME/clang" --strip-components=1
           rm -f clang.tar.gz
 
-      - name: Clone kernel source
+      - name: Clone kernel source (tag r1)
         run: |
           if [ -n "${{ inputs.kernel_branch }}" ]; then
             git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
           else
             git clone --depth=1 "${{ inputs.kernel_repo }}" kernel
           fi
+          git -C kernel log -1 --oneline
 
       - name: Integrate SukiSU Nova (builtin branch)
         working-directory: kernel
@@ -78,52 +79,7 @@ jobs:
           PATCH_RC=$?
           set -e
           rm -f susfs_patch_to_4.19.patch
-          if [ -f "fs/proc/task_mmu.c.rej" ]; then
-            echo "[+] Applying targeted fixup for fs/proc/task_mmu.c Hunk #7..."
-            python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
-            from pathlib import Path
 
-          path = Path("fs/proc/task_mmu.c")
-          content = path.read_text()
-
-          target = (
-              "\t\tret = down_read_killable(&mm->mmap_sem);\n"
-              "\t\tif (ret)\n"
-              "\t\t\tgoto out_free;\n"
-              "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
-              "\t\tup_read(&mm->mmap_sem);\n"
-          )
-
-          replacement = (
-              "\t\tret = down_read_killable(&mm->mmap_sem);\n"
-              "\t\tif (ret)\n"
-              "\t\t\tgoto out_free;\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\t\tvma = find_vma(mm, start_vaddr);\n"
-              "\t\tif (vma && vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
-              "\t\t\tgoto bypass_orig_flow;\n"
-              "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
-              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "bypass_orig_flow:\n"
-              "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-              "\t\tup_read(&mm->mmap_sem);\n"
-          )
-          
-          assert content.count(target) == 1, f"Expected target anchor once, found {content.count(target)}"
-          updated = content.replace(target, replacement, 1)
-          path.write_text(updated)
-          Path("fs/proc/task_mmu.c.rej").unlink()
-
-          lines = updated.splitlines()
-          idx = next(i for i, l in enumerate(lines) if "bypass_orig_flow:" in l)
-          for i in range(max(0, idx - 15), min(len(lines), idx + 10)):
-              print(f"{i + 1}: {lines[i]}")
-          PYEOF
-            if [ -z "$(find . -name '*.rej')" ]; then
-              PATCH_RC=0
-            fi
-          fi
           REJ_FILES=$(find . -name "*.rej")
           if [ -n "$REJ_FILES" ]; then
             echo "::warning::Patch produced reject (.rej) files:"
@@ -254,7 +210,7 @@ jobs:
           cat << 'EOF' > AnyKernel3/anykernel.sh
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=SukiSU-Nova-SUSFS-pipa
+          kernel.string=SukiSU-Nova-SUSFS-pipa-r1
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -279,14 +235,14 @@ jobs:
           EOF
 
           cd AnyKernel3
-          ZIP_NAME="SukiSU-Nova-SUSFS-pipa-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
+          ZIP_NAME="SukiSU-Nova-SUSFS-pipa-r1-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
           zip -r9 "../$ZIP_NAME" ./*
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
       - name: Upload AnyKernel3 artifact and config audit
         uses: actions/upload-artifact@v4
         with:
-          name: SukiSU-Nova-SUSFS-pipa-AnyKernel3
+          name: SukiSU-Nova-SUSFS-pipa-r1-AnyKernel3
           path: |
             ${{ env.ZIP_NAME }}
             config-audit.txt
