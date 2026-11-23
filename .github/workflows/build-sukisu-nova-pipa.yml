@@ -80,7 +80,7 @@ jobs:
           rm -f susfs_patch_to_4.19.patch
           if [ -f "fs/proc/task_mmu.c.rej" ]; then
             echo "[+] Applying targeted fixup for fs/proc/task_mmu.c Hunk #7..."
-            python3 - << 'PYEOF'
+            python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
             from pathlib import Path
 
           path = Path("fs/proc/task_mmu.c")
