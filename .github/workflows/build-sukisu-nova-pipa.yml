@@ -1,16 +1,12 @@
-name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa r1)
+name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa r1.zip)
 
 on:
   workflow_dispatch:
     inputs:
-      kernel_repo:
-        description: 'Kernel git URL'
+      kernel_zip_url:
+        description: 'Direct kernel source zip URL'
         required: true
-        default: 'https://github.com/CuriousNom/n0_kernel_pipa.git'
-      kernel_branch:
-        description: 'Branch or tag name (pinned to r1)'
-        required: false
-        default: 'r1'
+        default: 'https://github.com/CuriousNom/n0_kernel_pipa/archive/refs/tags/r1.zip'
       defconfig:
         description: 'Defconfig path (leave empty to auto-detect pipa defconfig)'
         required: false
@@ -49,14 +45,16 @@ jobs:
           tar -xzf clang.tar.gz -C "$HOME/clang" --strip-components=1
           rm -f clang.tar.gz
 
-      - name: Clone kernel source (tag r1)
+      - name: Download and extract kernel source (r1.zip)
+        shell: bash
         run: |
-          if [ -n "${{ inputs.kernel_branch }}" ]; then
-            git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
-          else
-            git clone --depth=1 "${{ inputs.kernel_repo }}" kernel
-          fi
-          git -C kernel log -1 --oneline
+          curl -fL "${{ inputs.kernel_zip_url }}" -o kernel_src.zip
+          mkdir -p tmp_src kernel
+          unzip -q kernel_src.zip -d tmp_src
+          shopt -s dotglob
+          mv tmp_src/*/* kernel/
+          rm -rf tmp_src kernel_src.zip
+          ls -la kernel/Makefile
 
       - name: Integrate SukiSU Nova (builtin branch)
         working-directory: kernel
