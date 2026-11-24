@@ -1,4 +1,4 @@
-name: Build SukiSU-Ultra + SUSFS AnyKernel3 (pipa r1)
+name: Build SukiSU-Ultra + KPM + SUSFS AnyKernel3 (pipa r1)
 
 on:
   workflow_dispatch:
@@ -8,7 +8,7 @@ on:
         required: true
         default: 'https://github.com/CuriousNom/n0_kernel_pipa/archive/refs/tags/r1.zip'
       clang_rev:
-        description: 'Google AOSP Clang revision (MLGO supported)'
+        description: 'Google AOSP Clang revision (native MLGO support)'
         type: choice
         default: 'clang-r522817'
         options:
@@ -78,11 +78,11 @@ jobs:
         working-directory: kernel
         run: |
           if [ -f "fs/susfs.c" ] && [ -f "include/linux/susfs.h" ]; then
-            echo "[+] SUSFS is ALREADY included in this kernel source — will NOT re-patch SUSFS!"
+            echo "[+] SUSFS is ALREADY included in kernel source — skipping SUSFS kernel patch."
             grep -E "SUSFS_VERSION" include/linux/susfs.h || true
             echo "SUSFS_ALREADY_PRESENT=true" >> "$GITHUB_ENV"
           else
-            echo "[+] SUSFS is NOT included in this kernel source — will apply SUSFS 4.19 backport."
+            echo "[+] SUSFS is NOT included in kernel source — will apply SUSFS 4.19 backport."
             echo "SUSFS_ALREADY_PRESENT=false" >> "$GITHUB_ENV"
           fi
 
@@ -94,7 +94,7 @@ jobs:
             echo "KSU_HOOKS_PRESENT=false" >> "$GITHUB_ENV"
           fi
 
-      - name: Integrate SukiSU-Ultra (GitHub, auto-select non-GKI branch)
+      - name: Integrate SukiSU-Ultra (builtin branch from GitHub)
         working-directory: kernel
         run: |
           set -euo pipefail
@@ -111,11 +111,11 @@ jobs:
           fi
 
           BRANCHES=$(git ls-remote --heads https://github.com/SukiSU-Ultra/SukiSU-Ultra.git | awk '{print $2}' | sed 's|refs/heads/||')
-          echo "[+] Available SukiSU-Ultra branches:"
+          echo "[+] Available branches:"
           echo "$BRANCHES"
 
           TARGET_BRANCH=""
-          for b in nongki susfs-main builtin main; do
+          for b in builtin nongki susfs-main main; do
             if echo "$BRANCHES" | grep -qx "$b"; then
               TARGET_BRANCH="$b"
               break
@@ -130,7 +130,7 @@ jobs:
           fi
           rm -f ksu_setup.sh
 
-          echo "[+] Checking drivers/kernelsu/Kconfig options:"
+          echo "[+] Checking drivers/kernelsu/Kconfig:"
           grep -E "^config (KSU|KPM)" drivers/kernelsu/Kconfig || true
 
       - name: Apply SUSFS 4.19 patches and inline hooks (only if missing)
@@ -140,7 +140,7 @@ jobs:
           PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches"
 
           if [ "${{ env.SUSFS_ALREADY_PRESENT }}" = "true" ]; then
-            echo "[+] Skipping susfs_patch_to_4.19.patch because SUSFS is already in kernel source."
+            echo "[+] Skipping susfs_patch_to_4.19.patch (already in source)."
           else
             echo "[+] Downloading susfs_patch_to_4.19.patch..."
             curl -fLSs --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.19.patch" -o susfs_patch_to_4.19.patch
@@ -221,15 +221,15 @@ jobs:
           fi
 
           if [ "${{ env.KSU_HOOKS_PRESENT }}" = "true" ]; then
-            echo "[+] Skipping susfs_inline_hook_patches.sh because KSU hooks are already in kernel source."
+            echo "[+] Skipping susfs_inline_hook_patches.sh (hooks already in source)."
           else
-            echo "[+] Applying SUSFS inline hook script for non-GKI 4.19..."
+            echo "[+] Applying SUSFS inline hook script..."
             curl -fLSs --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o susfs_inline_hook_patches.sh
             bash susfs_inline_hook_patches.sh
             rm -f susfs_inline_hook_patches.sh
           fi
 
-          echo "[+] Verifying SUSFS source files exist:"
+          echo "[+] Verifying SUSFS source files:"
           ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
 
       - name: Upload patch rejects (on conflict)
@@ -238,7 +238,8 @@ jobs:
         with:
           name: susfs-patch-rejects
           path: patch-rejects/
-      - name: Apply Linux 4.19 compat fixes (static_call.h + SUSFS v2.4.0)
+
+      - name: Apply Linux 4.19 compat fixes (static_call, SUSFS 2.4, KPM access_ok, sulog, devpts)
         working-directory: kernel
         run: |
           python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
@@ -257,14 +258,13 @@ jobs:
                   )
                   text = text.replace(needle, replacement, 1)
                   inc_path.write_text(text)
-                  print("[+] Guarded <linux/static_call.h> in drivers/kernelsu/kernel_includes.h")
+                  print("[+] Fix 1: Guarded <linux/static_call.h> in kernel_includes.h")
 
-          # Fix 2: Ensure CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER exists in Kconfig if referenced by SUSFS v2.4.0
+          # Fix 2: Ensure CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER exists in Kconfig
           susfs_h = pathlib.Path("include/linux/susfs.h").read_text() if pathlib.Path("include/linux/susfs.h").exists() else ""
           susfs_def_h = pathlib.Path("include/linux/susfs_def.h").read_text() if pathlib.Path("include/linux/susfs_def.h").exists() else ""
           susfs_c = pathlib.Path("fs/susfs.c").read_text() if pathlib.Path("fs/susfs.c").exists() else ""
           kconfig_path = pathlib.Path("drivers/kernelsu/Kconfig")
-
           if kconfig_path.exists():
               kc = kconfig_path.read_text()
               if ("KSU_SUSFS_PRIORITY_UID_FILTER" in (susfs_h + susfs_def_h + susfs_c)
@@ -277,23 +277,15 @@ jobs:
                   )
                   kc = kc.replace("\nendmenu", stanza + "\nendmenu", 1) if "\nendmenu" in kc else (kc + stanza)
                   kconfig_path.write_text(kc)
-                  print("[+] Added missing config KSU_SUSFS_PRIORITY_UID_FILTER to drivers/kernelsu/Kconfig")
+                  print("[+] Fix 2: Added config KSU_SUSFS_PRIORITY_UID_FILTER to drivers/kernelsu/Kconfig")
 
-          # Fix 3: Diagnose & fix implicit declaration of susfs_is_current_app_uid in fs/stat.c
+          # Fix 3: Ensure fs/stat.c includes the header declaring susfs_is_current_app_uid
           stat_path = pathlib.Path("fs/stat.c")
           if stat_path.exists():
               stat_txt = stat_path.read_text()
               if "susfs_is_current_app_uid" in stat_txt:
                   decl_in_susfs = "susfs_is_current_app_uid" in susfs_h
                   decl_in_def = "susfs_is_current_app_uid" in susfs_def_h
-                  print(f"[i] susfs_is_current_app_uid declared in susfs.h={decl_in_susfs}, susfs_def.h={decl_in_def}")
-
-                  for name, content in [("include/linux/susfs.h", susfs_h), ("include/linux/susfs_def.h", susfs_def_h)]:
-                      for m in re.finditer(r"susfs_is_current_app_uid", content):
-                          start = max(0, m.start() - 250)
-                          end = min(len(content), m.end() + 150)
-                          print(f"--- Context in {name} ---\n{content[start:end]}\n---")
-
                   if decl_in_susfs and "#include <linux/susfs.h>" not in stat_txt:
                       if "#include <linux/susfs_def.h>" in stat_txt:
                           stat_txt = stat_txt.replace(
@@ -304,26 +296,26 @@ jobs:
                       else:
                           stat_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n" + stat_txt
                       stat_path.write_text(stat_txt)
-                      print("[+] Added #include <linux/susfs.h> to fs/stat.c")
+                      print("[+] Fix 3: Added #include <linux/susfs.h> to fs/stat.c")
                   elif decl_in_def and "#include <linux/susfs_def.h>" not in stat_txt:
                       stat_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n" + stat_txt
                       stat_path.write_text(stat_txt)
-                      print("[+] Added #include <linux/susfs_def.h> to fs/stat.c")
+                      print("[+] Fix 3: Added #include <linux/susfs_def.h> to fs/stat.c")
 
-          # Fix 4: Linux < 5.0 access_ok() requires 3 args (VERIFY_WRITE, addr, size) in kpm.c
+          # Fix 4: Linux < 5.0 3-argument access_ok(VERIFY_WRITE, addr, size) in kpm.c
           kpm_path = pathlib.Path("drivers/kernelsu/extension/kpm/kpm.c")
           if kpm_path.exists():
               kpm_txt = kpm_path.read_text()
               old_call = "access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))"
               if old_call in kpm_txt:
-                  new_call = "access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))"
-                  kpm_txt = kpm_txt.replace(old_call, new_call)
+                  kpm_txt = kpm_txt.replace(
+                      old_call,
+                      "access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))"
+                  )
                   kpm_path.write_text(kpm_txt)
-                  print("[+] Fixed 3-arg access_ok() for Linux 4.19 in drivers/kernelsu/extension/kpm/kpm.c")
-              else:
-                  print("[!] Expected access_ok() pattern not found in kpm.c")
+                  print("[+] Fix 4: Patched 3-arg access_ok() in drivers/kernelsu/extension/kpm/kpm.c")
 
-          # Fix 5: Linux < 5.8 uses __strncpy_from_user_nofault (already declared in kernel_compat.h:69)
+          # Fix 5: Linux < 5.8 __strncpy_from_user_nofault helper in sulog/event.c
           event_path = pathlib.Path("drivers/kernelsu/sulog/event.c")
           if event_path.exists():
               ev_txt = event_path.read_text()
@@ -334,22 +326,20 @@ jobs:
               )
               if count > 0:
                   event_path.write_text(new_ev_txt)
-                  print(f"[+] Replaced {count} call(s) to strncpy_from_user_nofault in drivers/kernelsu/sulog/event.c")
-              else:
-                  print("[!] No bare strncpy_from_user_nofault() calls found in sulog/event.c")
+                  print(f"[+] Fix 5: Replaced {count} strncpy_from_user_nofault() call(s) in sulog/event.c")
 
-          # Fix 6: Neutralize legacy ksu_handle_devpts call in fs/devpts/inode.c
+          # Fix 6: Neutralize legacy ksu_handle_devpts call in fs/devpts/inode.c (not exported in SukiSU-Ultra v3.0.0)
           devpts_path = pathlib.Path("fs/devpts/inode.c")
           if devpts_path.exists():
-            dp_txt = devpts_path.read_text()
-            if "ksu_handle_devpts" in dp_txt:
-              dp_lines = [
-                  ("// " + l if "extern" in l else re.sub(r"ksu_handle_devpts\s*\(", "(void)(", l))
-                  if "ksu_handle_devpts" in l else l
-                  for l in dp_txt.splitlines(keepends=True)
+              dp_txt = devpts_path.read_text()
+              if "ksu_handle_devpts" in dp_txt:
+                  dp_lines = [
+                      ("// " + l if "extern" in l else re.sub(r"ksu_handle_devpts\s*\(", "(void)(", l))
+                      if "ksu_handle_devpts" in l else l
+                      for l in dp_txt.splitlines(keepends=True)
                   ]
                   devpts_path.write_text("".join(dp_lines))
-                  print("[+] Neutralized legacy ksu_handle_devpts in fs/devpts/inode.c")
+                  print("[+] Fix 6: Neutralized legacy ksu_handle_devpts in fs/devpts/inode.c")
           PYEOF
 
       - name: Locate pipa defconfig and inject SukiSU-Ultra + SUSFS + KPM flags
@@ -372,7 +362,7 @@ jobs:
           CFG_FILE="arch/arm64/configs/$DEFCONFIG"
           cat << 'EOF' >> "$CFG_FILE"
 
-          # SukiSU-Ultra (4.19 non-GKI + KPM)
+          # SukiSU-Ultra / Nova (4.19 non-GKI builtin + KPM)
           CONFIG_KSU=y
           CONFIG_KPM=y
           CONFIG_KALLSYMS=y
@@ -380,7 +370,6 @@ jobs:
           CONFIG_OVERLAY_FS=y
           EOF
 
-          # Enable manual hooks and disable kprobes hook when supported by Kconfig
           if grep -q "config KSU_MANUAL_HOOK" drivers/kernelsu/Kconfig 2>/dev/null; then
             echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CFG_FILE"
           fi
@@ -391,7 +380,7 @@ jobs:
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
             cat << 'EOF' >> "$CFG_FILE"
 
-          # SUSFS options
+          # SUSFS v2.4.0 options
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -405,15 +394,14 @@ jobs:
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
           EOF
-            if grep -q "config KSU_SUSFS_PRIORITY_UID_FILTER" drivers/kernelsu/Kconfig 2>/dev/null; then
-              echo "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y" >> "$CFG_FILE"
-            fi
           fi
 
       - name: Compile kernel (Image only)
         working-directory: kernel
         run: |
+          set -o pipefail
           export PATH="$HOME/clang/bin:$PATH"
           export ARCH=arm64
           export SUBARCH=arm64
@@ -449,18 +437,17 @@ jobs:
             grep -q "^CONFIG_KSU_SUSFS=y$" out/.config
           fi
 
-          set -o pipefail
           make -j"$(nproc)" "${MAKE_ARGS[@]}" Image 2>&1 | tee ../build.log
           file out/arch/arm64/boot/Image
 
-      - name: Extract and upload compiler errors (on failure)
+      - name: Extract compiler errors (on failure)
         if: failure()
         run: |
           if [ -f build.log ]; then
-            grep -nE "error:|fatal error:" build.log | head -n 120 > compile-errors.txt || true
+            grep -nE "error:|fatal error:|undefined symbol:" build.log | head -n 120 > compile-errors.txt || true
             tail -n 150 build.log > build-tail.txt || true
-            cat compile-errors.txt || true
           fi
+
       - name: Upload compile error logs (on failure)
         if: failure()
         uses: actions/upload-artifact@v4
@@ -480,7 +467,7 @@ jobs:
           cat << 'EOF' > AnyKernel3/anykernel.sh
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=SukiSU-Ultra-SUSFS-pipa-r1
+          kernel.string=SukiSU-Ultra-KPM-SUSFS-pipa-r1
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -509,14 +496,14 @@ jobs:
           test ! -e AnyKernel3/dtbo.img
 
           cd AnyKernel3
-          ZIP_NAME="SukiSU-Ultra-SUSFS-pipa-r1-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
+          ZIP_NAME="SukiSU-Ultra-KPM-SUSFS-pipa-r1-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
           zip -r9 "../$ZIP_NAME" ./*
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
       - name: Upload AnyKernel3 artifact and config audit
         uses: actions/upload-artifact@v4
         with:
-          name: SukiSU-Ultra-SUSFS-pipa-r1-AnyKernel3
+          name: SukiSU-Ultra-KPM-SUSFS-pipa-r1-AnyKernel3
           path: |
             ${{ env.ZIP_NAME }}
             config-audit.txt
