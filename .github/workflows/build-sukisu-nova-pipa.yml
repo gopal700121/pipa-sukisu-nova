@@ -436,18 +436,21 @@ jobs:
                   f"sus_fac={bool(sus_fac)}, sus_stat={bool(sus_stat)}"
               )
 
-              # Copy any static helpers defined in the #else branch before user_fac if needed
+              # Copy all static helpers defined in the #else branch before user_fac (e.g. is_su_allowed, ksu_sucompat_user_common)
               else_pos = suc_txt.rfind("#else", 0, user_fac[0])
               extra_helpers = ""
               if else_pos != -1:
                   between = suc_txt[else_pos:user_fac[0]]
-                  for hm in re.finditer(r"static\s+[^{;]+\([^)]*\)\s*\{", between):
+                  seen_helpers = set()
+                  for hm in re.finditer(r"^static\s+(?:inline\s+)?[^;{]+?\b(\w+)\s*\([^)]*\)\s*\{", between, re.MULTILINE | re.DOTALL):
+                      helper_name = hm.group(1)
+                      if helper_name in seen_helpers or helper_name in suc_txt[:sus_fac[0]]:
+                          continue
                       hf = extract_c_func(between, re.escape(hm.group(0)))
-                      if hf and hf[2].split("(")[0].split()[-1] in (user_fac[2] + user_stat[2]):
-                          helper_name = hf[2].split("(")[0].split()[-1]
-                          if helper_name not in suc_txt[:sus_fac[0]]:
-                              extra_helpers += hf[2] + "\n\n"
-
+                      if hf:
+                          seen_helpers.add(helper_name)
+                          extra_helpers += hf[2] + "\n\n"
+                          print(f"[+] Fix 8b helper copied into CONFIG_KSU_SUSFS: {helper_name}")
               new_fac_body = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', user_fac[2])
               new_stat_body = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', user_stat[2])
               extra_helpers = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', extra_helpers)
