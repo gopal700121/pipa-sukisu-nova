@@ -370,26 +370,192 @@ jobs:
                   )
                   reboot_path.write_text(rb_txt)
                   print("[+] Fix 7: Wired ksu_handle_sys_reboot() into SYSCALL_DEFINE4(reboot) in kernel/reboot.c")
+          # Fix 8: Align ksu_handle_faccessat/stat ABI under CONFIG_KSU_SUSFS with fs/open.c & fs/stat.c (const char __user **) and check ksu_handle_setresuid
+          suh_path = pathlib.Path("drivers/kernelsu/feature/sucompat.h")
+          suc_path = pathlib.Path("drivers/kernelsu/feature/sucompat.c")
+          lsm_path = pathlib.Path("drivers/kernelsu/hook/lsm_hook.c")
+
+          if suh_path.exists():
+              print("=== sucompat.h (before Fix 8) ===")
+              print(suh_path.read_text())
+          if suc_path.exists():
+              suc_lines = suc_path.read_text().splitlines()
+              print("=== sucompat.c lines 175-310 (before Fix 8) ===")
+              for idx in range(174, min(len(suc_lines), 310)):
+                  print(f"{idx+1}: {suc_lines[idx]}")
+
+          print("=== Scanning fs/ for ksu_handle_faccessat and ksu_handle_stat callers ===")
+          for p in sorted(pathlib.Path("fs").rglob("*.c")):
+              ptxt = p.read_text(errors="ignore")
+              if "ksu_handle_faccessat" in ptxt or "ksu_handle_stat" in ptxt:
+                  for ln_i, ln in enumerate(ptxt.splitlines(), 1):
+                      if "ksu_handle_faccessat" in ln or "ksu_handle_stat" in ln:
+                          print(f"  {p}:{ln_i}: {ln.strip()}")
+
+          if suh_path.exists() and suc_path.exists():
+              suh_txt = suh_path.read_text()
+              old_h_fac = "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);"
+              new_h_fac = "int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);"
+              old_h_stat = "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);"
+              new_h_stat = "int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);"
+              if old_h_fac in suh_txt:
+                  assert suh_txt.count(old_h_fac) == 1
+                  suh_txt = suh_txt.replace(old_h_fac, new_h_fac, 1)
+              if old_h_stat in suh_txt:
+                  assert suh_txt.count(old_h_stat) == 1
+                  suh_txt = suh_txt.replace(old_h_stat, new_h_stat, 1)
+              suh_path.write_text(suh_txt)
+              print("[+] Fix 8a: Aligned ksu_handle_faccessat & ksu_handle_stat prototypes in sucompat.h")
+
+              def extract_c_func(src, sig_regex):
+                  m = re.search(sig_regex, src, re.MULTILINE)
+                  if not m:
+                      return None
+                  start = m.start()
+                  brace = src.find("{", m.end() - 1)
+                  depth = 0
+                  i = brace
+                  while i < len(src):
+                      if src[i] == "{":
+                          depth += 1
+                      elif src[i] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              return (start, i + 1, src[start:i + 1])
+                      i += 1
+                  return None
+
+              suc_txt = suc_path.read_text()
+              user_fac = extract_c_func(suc_txt, r"^int\s+ksu_handle_faccessat\s*\([^)]*const\s+char\s+__user\s*\*\*[^)]*\)\s*\{")
+              user_stat = extract_c_func(suc_txt, r"^int\s+ksu_handle_stat\s*\([^)]*const\s+char\s+__user\s*\*\*[^)]*\)\s*\{")
+              sus_fac = extract_c_func(suc_txt, r"^int\s+ksu_handle_faccessat\s*\([^)]*struct\s+filename\s*\*\*[^)]*\)\s*\{")
+              sus_stat = extract_c_func(suc_txt, r"^int\s+ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*[^)]*\)\s*\{")
+
+              assert user_fac and user_stat and sus_fac and sus_stat, (
+                  f"Failed to locate sucompat.c funcs: user_fac={bool(user_fac)}, user_stat={bool(user_stat)}, "
+                  f"sus_fac={bool(sus_fac)}, sus_stat={bool(sus_stat)}"
+              )
+
+              # Copy any static helpers defined in the #else branch before user_fac if needed
+              else_pos = suc_txt.rfind("#else", 0, user_fac[0])
+              extra_helpers = ""
+              if else_pos != -1:
+                  between = suc_txt[else_pos:user_fac[0]]
+                  for hm in re.finditer(r"static\s+[^{;]+\([^)]*\)\s*\{", between):
+                      hf = extract_c_func(between, re.escape(hm.group(0)))
+                      if hf and hf[2].split("(")[0].split()[-1] in (user_fac[2] + user_stat[2]):
+                          helper_name = hf[2].split("(")[0].split()[-1]
+                          if helper_name not in suc_txt[:sus_fac[0]]:
+                              extra_helpers += hf[2] + "\n\n"
+
+              new_fac_body = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', user_fac[2])
+              new_stat_body = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', user_stat[2])
+              extra_helpers = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', extra_helpers)
+
+              # Replace sus_stat first (higher offset) then sus_fac
+              if sus_stat[0] > sus_fac[0]:
+                  suc_txt = suc_txt[:sus_stat[0]] + new_stat_body + suc_txt[sus_stat[1]:]
+                  suc_txt = suc_txt[:sus_fac[0]] + extra_helpers + new_fac_body + suc_txt[sus_fac[1]:]
+              else:
+                  suc_txt = suc_txt[:sus_fac[0]] + extra_helpers + new_fac_body + suc_txt[sus_fac[1]:]
+                  sus_stat2 = extract_c_func(suc_txt, r"^int\s+ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*[^)]*\)\s*\{")
+                  suc_txt = suc_txt[:sus_stat2[0]] + new_stat_body + suc_txt[sus_stat2[1]:]
+
+              suc_path.write_text(suc_txt)
+              print("[+] Fix 8b: Aligned ksu_handle_faccessat & ksu_handle_stat definitions in sucompat.c to const char __user **")
+
+          # Check lsm_hook.c for ksu_handle_setresuid registration
+          if lsm_path.exists():
+              lsm_txt = lsm_path.read_text()
+              has_lsm_reg = ("security_add_hooks" in lsm_txt and "task_fix_setuid" in lsm_txt)
+              print(f"[i] lsm_hook.c security_add_hooks + task_fix_setuid present: {has_lsm_reg}")
+              if not has_lsm_reg:
+                  sys_c = pathlib.Path("kernel/sys.c")
+                  if sys_c.exists():
+                      stxt = sys_c.read_text()
+                      if "ksu_handle_setresuid" not in stxt:
+                          anchor = "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)\n{"
+                          if anchor in stxt:
+                              assert stxt.count(anchor) == 1
+                              stxt = stxt.replace(
+                                  anchor,
+                                  "#ifdef CONFIG_KSU\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n"
+                                  + anchor + "\n#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif",
+                                  1
+                              )
+                              sys_c.write_text(stxt)
+                              print("[+] Fix 8c: Wired ksu_handle_setresuid into __sys_setresuid in kernel/sys.c")
           PYEOF
 
       - name: Audit SukiSU v3.0.0 hooks in kernel source
         working-directory: kernel
         run: |
           {
-            echo "=== Hooks defined/expected by drivers/kernelsu ==="
-            grep -rnE "ksu_handle_(sys_reboot|execveat|faccessat|stat|newfstat|setresuid)" drivers/kernelsu/ | head -n 50 || true
+            echo "=== Caller context: fs/open.c (350-375) ==="
+            nl -ba fs/open.c | sed -n '350,375p' || true
             echo ""
-            echo "=== Hooks present in kernel/reboot.c, kernel/sys.c, fs/ ==="
-            grep -rnE "ksu_handle_|ksu_.*_hook" kernel/reboot.c kernel/sys.c fs/exec.c fs/open.c fs/stat.c fs/read_write.c 2>/dev/null || true
+            echo "=== Caller context: fs/stat.c (203-235) ==="
+            nl -ba fs/stat.c | sed -n '203,235p' || true
+            echo ""
+            echo "=== Caller context: fs/exec.c (1988-2010) ==="
+            nl -ba fs/exec.c | sed -n '1988,2010p' || true
+            echo ""
+            echo "=== Active CONFIG_KSU_SUSFS=1 preprocessed prototypes (sucompat.h) ==="
+            "$HOME/clang/bin/clang" -E -P -DCONFIG_KSU=1 -DCONFIG_KSU_SUSFS=1 -Iinclude -Idrivers/kernelsu drivers/kernelsu/feature/sucompat.h 2>/dev/null | grep -E "ksu_handle_(faccessat|stat|execveat)" || true
+            echo ""
+            echo "=== lsm_hook.c (lines 125-185) ==="
+            nl -ba drivers/kernelsu/hook/lsm_hook.c | sed -n '125,185p' || true
+            echo ""
+            echo "=== ksu_handle_setresuid in kernel/sys.c ==="
+            grep -n "ksu_handle_setresuid" kernel/sys.c 2>/dev/null || echo "(none in kernel/sys.c)"
+            echo ""
+            echo "=== Hooks present in kernel/reboot.c ==="
+            grep -n "ksu_handle_sys_reboot" kernel/reboot.c 2>/dev/null || echo "(none in kernel/reboot.c)"
           } | tee ../hook-audit.txt
+
+          # Hard ABI signature verification gate
+          python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+          import pathlib, re, subprocess, os
+
+          open_c = pathlib.Path("fs/open.c").read_text()
+          stat_c = pathlib.Path("fs/stat.c").read_text()
+          open_uses_user = bool(re.search(r"extern\s+int\s+ksu_handle_faccessat\s*\([^)]*const\s+char\s+__user\s*\*\*", open_c))
+          stat_uses_user = bool(re.search(r"extern\s+int\s+ksu_handle_stat\s*\([^)]*const\s+char\s+__user\s*\*\*", stat_c))
+
+          clang_bin = os.path.expanduser("~/clang/bin/clang")
+          pp = subprocess.run(
+              [clang_bin, "-E", "-P", "-DCONFIG_KSU=1", "-DCONFIG_KSU_SUSFS=1", "-Iinclude", "-Idrivers/kernelsu", "drivers/kernelsu/feature/sucompat.h"],
+              capture_output=True, text=True
+          ).stdout
+          if "ksu_handle_faccessat" not in pp:
+              suh_txt = pathlib.Path("drivers/kernelsu/feature/sucompat.h").read_text()
+              pp = suh_txt.split("#else")[0] if "#else" in suh_txt else suh_txt
+
+          h_fac_user = bool(re.search(r"ksu_handle_faccessat\s*\([^)]*const\s+char\s+__user\s*\*\*", pp))
+          h_stat_user = bool(re.search(r"ksu_handle_stat\s*\([^)]*const\s+char\s+__user\s*\*\*", pp))
+          h_fac_fn = bool(re.search(r"ksu_handle_faccessat\s*\([^)]*struct\s+filename\s*\*\*", pp))
+          h_stat_fn = bool(re.search(r"ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*", pp))
+
+          print(f"[ABI Gate] fs/open.c user_ptr={open_uses_user} | sucompat.h(SUSFS) user_ptr={h_fac_user}, filename_ptr={h_fac_fn}")
+          print(f"[ABI Gate] fs/stat.c user_ptr={stat_uses_user} | sucompat.h(SUSFS) user_ptr={h_stat_user}, filename_ptr={h_stat_fn}")
+
+          if open_uses_user and (not h_fac_user or h_fac_fn):
+              raise SystemExit("ABI MISMATCH: fs/open.c passes const char __user ** to ksu_handle_faccessat, but active sucompat.h does not match!")
+          if stat_uses_user and (not h_stat_user or h_stat_fn):
+              raise SystemExit("ABI MISMATCH: fs/stat.c passes const char __user ** to ksu_handle_stat, but active sucompat.h does not match!")
+
+          suc_txt = pathlib.Path("drivers/kernelsu/feature/sucompat.c").read_text()
+          if re.search(r"^int\s+ksu_handle_(faccessat|stat)\s*\([^)]*struct\s+filename\s*\*\*", suc_txt, re.MULTILINE):
+              raise SystemExit("ABI MISMATCH: sucompat.c still defines a struct filename ** version of ksu_handle_faccessat or ksu_handle_stat!")
+          print("[+] ABI Gate PASSED: sucompat.h & sucompat.c match fs/open.c & fs/stat.c (const char __user **).")
+          PYEOF
 
           if grep -rq "ksu_handle_sys_reboot" drivers/kernelsu/ 2>/dev/null; then
             if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c 2>/dev/null; then
-              echo "::warning::drivers/kernelsu defines ksu_handle_sys_reboot, but kernel/reboot.c does NOT call it! Manager app may show Not Installed unless patched."
-              echo "MISSING_REBOOT_HOOK=true" >> "$GITHUB_ENV"
+              echo "::error::drivers/kernelsu defines ksu_handle_sys_reboot, but kernel/reboot.c does NOT call it!"
+              exit 1
             else
               echo "[+] Verified: kernel/reboot.c calls ksu_handle_sys_reboot."
-              echo "MISSING_REBOOT_HOOK=false" >> "$GITHUB_ENV"
             fi
           fi
 
