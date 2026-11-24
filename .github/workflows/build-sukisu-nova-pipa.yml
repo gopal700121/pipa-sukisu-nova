@@ -309,6 +309,34 @@ jobs:
                       stat_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n" + stat_txt
                       stat_path.write_text(stat_txt)
                       print("[+] Added #include <linux/susfs_def.h> to fs/stat.c")
+
+          # Fix 4: Linux < 5.0 access_ok() requires 3 args (VERIFY_WRITE, addr, size) in kpm.c
+          kpm_path = pathlib.Path("drivers/kernelsu/extension/kpm/kpm.c")
+          if kpm_path.exists():
+              kpm_txt = kpm_path.read_text()
+              old_call = "access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))"
+              if old_call in kpm_txt:
+                  new_call = "access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))"
+                  kpm_txt = kpm_txt.replace(old_call, new_call)
+                  kpm_path.write_text(kpm_txt)
+                  print("[+] Fixed 3-arg access_ok() for Linux 4.19 in drivers/kernelsu/extension/kpm/kpm.c")
+              else:
+                  print("[!] Expected access_ok() pattern not found in kpm.c")
+
+          # Fix 5: Linux < 5.8 uses __strncpy_from_user_nofault (already declared in kernel_compat.h:69)
+          event_path = pathlib.Path("drivers/kernelsu/sulog/event.c")
+          if event_path.exists():
+              ev_txt = event_path.read_text()
+              new_ev_txt, count = re.subn(
+                  r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(',
+                  '__strncpy_from_user_nofault(',
+                  ev_txt
+              )
+              if count > 0:
+                  event_path.write_text(new_ev_txt)
+                  print(f"[+] Replaced {count} call(s) to strncpy_from_user_nofault in drivers/kernelsu/sulog/event.c")
+              else:
+                  print("[!] No bare strncpy_from_user_nofault() calls found in sulog/event.c")
           PYEOF
 
       - name: Locate pipa defconfig and inject SukiSU-Ultra + SUSFS + KPM flags
