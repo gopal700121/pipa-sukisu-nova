@@ -1,4 +1,4 @@
-name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa r1.zip)
+name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa r1)
 
 on:
   workflow_dispatch:
@@ -7,6 +7,13 @@ on:
         description: 'Direct kernel source zip URL'
         required: true
         default: 'https://github.com/CuriousNom/n0_kernel_pipa/archive/refs/tags/r1.zip'
+      clang_rev:
+        description: 'Google AOSP Clang revision (MLGO supported)'
+        type: choice
+        default: 'clang-r522817'
+        options:
+          - clang-r522817
+          - clang-r547379
       defconfig:
         description: 'Defconfig path (leave empty to auto-detect pipa defconfig)'
         required: false
@@ -16,14 +23,14 @@ on:
         type: boolean
         default: true
       hook_mode:
-        description: 'KSU hook method (do not mix both)'
+        description: 'KSU hook method (never mix both)'
         type: choice
         default: 'arm64_branch_link'
         options:
           - arm64_branch_link
           - susfs_inline
       fail_on_patch_reject:
-        description: 'Stop immediately if susfs_patch_to_4.19.patch has .rej conflicts'
+        description: 'Stop immediately if susfs_patch_to_4.19.patch has unresolved .rej conflicts'
         type: boolean
         default: true
 
@@ -35,20 +42,38 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y build-essential bc bison flex libssl-dev \
-            libelf-dev cpio zip unzip curl wget git python-is-python3 patch \
+            libelf-dev cpio zip unzip curl wget git python-is-python3 patch file \
             gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
 
-      - name: Download Proton Clang toolchain
+      - name: Download & verify Google AOSP Clang (MLGO)
+        shell: bash
         run: |
-          mkdir -p "$HOME/clang"
-          wget -q "https://github.com/kdrag0n/proton-clang/archive/refs/tags/20210522.tar.gz" -O clang.tar.gz
-          tar -xzf clang.tar.gz -C "$HOME/clang" --strip-components=1
-          rm -f clang.tar.gz
+          set -euo pipefail
+          DOWNLOADED=0
+          for REV in "${{ inputs.clang_rev }}" "clang-r547379" "clang-r522817"; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${REV}.tar.gz"
+            echo "[+] Trying AOSP Clang: $REV"
+            if curl -fL --retry 3 "$URL" -o clang.tar.gz; then
+              rm -rf "$HOME/clang" && mkdir -p "$HOME/clang"
+              tar -xzf clang.tar.gz -C "$HOME/clang"
+              rm -f clang.tar.gz
+              if "$HOME/clang/bin/clang" -mllvm -regalloc-enable-advisor=release -x c -c /dev/null -o /dev/null; then
+                echo "[+] Verified $REV with native MLGO support:"
+                "$HOME/clang/bin/clang" --version
+                DOWNLOADED=1
+                break
+              fi
+            fi
+          done
+          if [ "$DOWNLOADED" -ne 1 ]; then
+            echo "::error::Failed to download a working AOSP Clang with MLGO support."
+            exit 1
+          fi
 
       - name: Download and extract kernel source (r1.zip)
         shell: bash
         run: |
-          curl -fL "${{ inputs.kernel_zip_url }}" -o kernel_src.zip
+          curl -fL --retry 3 "${{ inputs.kernel_zip_url }}" -o kernel_src.zip
           mkdir -p tmp_src kernel
           unzip -q kernel_src.zip -d tmp_src
           shopt -s dotglob
@@ -60,7 +85,7 @@ jobs:
         working-directory: kernel
         run: |
           rm -rf KernelSU drivers/kernelsu
-          curl -LSs "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh" | bash -s builtin
+          curl -fLSs "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh" | bash -s builtin
 
       - name: Apply SUSFS 4.19 non-GKI backport patches
         if: ${{ inputs.enable_susfs }}
@@ -69,7 +94,7 @@ jobs:
           PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches"
 
           echo "[+] Downloading susfs_patch_to_4.19.patch..."
-          curl -fLSs "${PATCH_BASE}/Patch/susfs_patch_to_4.19.patch" -o susfs_patch_to_4.19.patch
+          curl -fLSs --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.19.patch" -o susfs_patch_to_4.19.patch
 
           echo "[+] Applying SUSFS 4.19 kernel patch..."
           set +e
@@ -77,6 +102,7 @@ jobs:
           PATCH_RC=$?
           set -e
           rm -f susfs_patch_to_4.19.patch
+
           if [ -f "fs/proc/task_mmu.c.rej" ]; then
             echo "[+] Applying targeted fixup for fs/proc/task_mmu.c Hunk #7..."
             python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
@@ -123,6 +149,7 @@ jobs:
               PATCH_RC=0
             fi
           fi
+
           REJ_FILES=$(find . -name "*.rej")
           if [ -n "$REJ_FILES" ]; then
             echo "::warning::Patch produced reject (.rej) files:"
@@ -135,7 +162,7 @@ jobs:
             done
             echo "HAS_REJECTS=true" >> "$GITHUB_ENV"
             if [ "${{ inputs.fail_on_patch_reject }}" = "true" ]; then
-              echo "::error::Stopping due to patch rejects. Download the 'susfs-patch-rejects' artifact to resolve them."
+              echo "::error::Stopping due to patch rejects. Download 'susfs-patch-rejects' artifact to resolve them."
               exit 1
             fi
           elif [ "$PATCH_RC" -ne 0 ]; then
@@ -145,7 +172,7 @@ jobs:
 
           if [ "${{ inputs.hook_mode }}" = "susfs_inline" ]; then
             echo "[+] Applying SUSFS inline hook script..."
-            curl -fLSs "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o susfs_inline_hook_patches.sh
+            curl -fLSs --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o susfs_inline_hook_patches.sh
             bash susfs_inline_hook_patches.sh
             rm -f susfs_inline_hook_patches.sh
           fi
@@ -213,7 +240,7 @@ jobs:
           EOF
           fi
 
-      - name: Compile kernel (Image + dtbs)
+      - name: Compile kernel (Image only)
         working-directory: kernel
         run: |
           export PATH="$HOME/clang/bin:$PATH"
@@ -223,32 +250,44 @@ jobs:
             O=out
             ARCH=arm64
             CC=clang
+            HOSTCC=clang
+            HOSTCXX=clang++
+            LD=ld.lld
+            HOSTLD=ld.lld
             AR=llvm-ar
             NM=llvm-nm
             OBJCOPY=llvm-objcopy
             OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
             STRIP=llvm-strip
             LLVM=1
             LLVM_IAS=1
+            CLANG_TRIPLE=aarch64-linux-gnu-
             CROSS_COMPILE=aarch64-linux-gnu-
             CROSS_COMPILE_ARM32=arm-linux-gnueabi-
           )
           make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
-          echo "[+] Auditing active KSU & SUSFS flags in out/.config:"
-          grep -E "^CONFIG_(KSU|KPM|KALLSYMS)" out/.config | tee ../config-audit.txt || true
+          echo "[+] Auditing active KSU, SUSFS, KPM & LTO flags in out/.config:"
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|LTO)" out/.config | tee ../config-audit.txt
 
-          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image dtbs
+          # Hard-assert required features are enabled before compiling
+          grep -q "^CONFIG_KSU=y$" out/.config
+          grep -q "^CONFIG_KPM=y$" out/.config
+          grep -q "^CONFIG_KALLSYMS_ALL=y$" out/.config
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            grep -q "^CONFIG_KSU_SUSFS=y$" out/.config
+          fi
 
-      - name: Package AnyKernel3 zip (without dtbo.img)
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image
+          file out/arch/arm64/boot/Image
+
+      - name: Package Image-only AnyKernel3 zip (no dtb, no dtbo)
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/README.md AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
 
           cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
-          if find kernel/out/arch/arm64/boot/dts -name '*.dtb' | grep -q .; then
-            find kernel/out/arch/arm64/boot/dts -name '*.dtb' -exec cat {} + > AnyKernel3/dtb
-          fi
 
           cat << 'EOF' > AnyKernel3/anykernel.sh
           ### AnyKernel3 Ramdisk Mod Script
@@ -276,6 +315,11 @@ jobs:
           split_boot;
           flash_boot;
           EOF
+
+          # Safety assertions: Image must exist, dtb/dtbo must NOT exist
+          test -s AnyKernel3/Image
+          test ! -e AnyKernel3/dtb
+          test ! -e AnyKernel3/dtbo.img
 
           cd AnyKernel3
           ZIP_NAME="SukiSU-Nova-SUSFS-pipa-r1-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
