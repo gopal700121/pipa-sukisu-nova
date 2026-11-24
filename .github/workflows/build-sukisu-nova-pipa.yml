@@ -238,6 +238,78 @@ jobs:
         with:
           name: susfs-patch-rejects
           path: patch-rejects/
+      - name: Apply Linux 4.19 compat fixes (static_call.h + SUSFS v2.4.0)
+        working-directory: kernel
+        run: |
+          python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+          import pathlib, re
+
+          # Fix 1: Guard #include <linux/static_call.h> for kernels < 5.10
+          inc_path = pathlib.Path("drivers/kernelsu/kernel_includes.h")
+          if inc_path.exists():
+              text = inc_path.read_text()
+              needle = "#include <linux/static_call.h>"
+              if needle in text and "KERNEL_VERSION(5, 10, 0)" not in text.split(needle)[0][-120:]:
+                  replacement = (
+                      "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+                      "#include <linux/static_call.h>\n"
+                      "#endif"
+                  )
+                  text = text.replace(needle, replacement, 1)
+                  inc_path.write_text(text)
+                  print("[+] Guarded <linux/static_call.h> in drivers/kernelsu/kernel_includes.h")
+
+          # Fix 2: Ensure CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER exists in Kconfig if referenced by SUSFS v2.4.0
+          susfs_h = pathlib.Path("include/linux/susfs.h").read_text() if pathlib.Path("include/linux/susfs.h").exists() else ""
+          susfs_def_h = pathlib.Path("include/linux/susfs_def.h").read_text() if pathlib.Path("include/linux/susfs_def.h").exists() else ""
+          susfs_c = pathlib.Path("fs/susfs.c").read_text() if pathlib.Path("fs/susfs.c").exists() else ""
+          kconfig_path = pathlib.Path("drivers/kernelsu/Kconfig")
+
+          if kconfig_path.exists():
+              kc = kconfig_path.read_text()
+              if ("KSU_SUSFS_PRIORITY_UID_FILTER" in (susfs_h + susfs_def_h + susfs_c)
+                      and "config KSU_SUSFS_PRIORITY_UID_FILTER" not in kc):
+                  stanza = (
+                      "\nconfig KSU_SUSFS_PRIORITY_UID_FILTER\n"
+                      "\tbool \"Enable SUSFS priority UID filter\"\n"
+                      "\tdepends on KSU_SUSFS\n"
+                      "\tdefault y\n"
+                  )
+                  kc = kc.replace("\nendmenu", stanza + "\nendmenu", 1) if "\nendmenu" in kc else (kc + stanza)
+                  kconfig_path.write_text(kc)
+                  print("[+] Added missing config KSU_SUSFS_PRIORITY_UID_FILTER to drivers/kernelsu/Kconfig")
+
+          # Fix 3: Diagnose & fix implicit declaration of susfs_is_current_app_uid in fs/stat.c
+          stat_path = pathlib.Path("fs/stat.c")
+          if stat_path.exists():
+              stat_txt = stat_path.read_text()
+              if "susfs_is_current_app_uid" in stat_txt:
+                  decl_in_susfs = "susfs_is_current_app_uid" in susfs_h
+                  decl_in_def = "susfs_is_current_app_uid" in susfs_def_h
+                  print(f"[i] susfs_is_current_app_uid declared in susfs.h={decl_in_susfs}, susfs_def.h={decl_in_def}")
+
+                  for name, content in [("include/linux/susfs.h", susfs_h), ("include/linux/susfs_def.h", susfs_def_h)]:
+                      for m in re.finditer(r"susfs_is_current_app_uid", content):
+                          start = max(0, m.start() - 250)
+                          end = min(len(content), m.end() + 150)
+                          print(f"--- Context in {name} ---\n{content[start:end]}\n---")
+
+                  if decl_in_susfs and "#include <linux/susfs.h>" not in stat_txt:
+                      if "#include <linux/susfs_def.h>" in stat_txt:
+                          stat_txt = stat_txt.replace(
+                              "#include <linux/susfs_def.h>",
+                              "#include <linux/susfs_def.h>\n#include <linux/susfs.h>",
+                              1
+                          )
+                      else:
+                          stat_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n" + stat_txt
+                      stat_path.write_text(stat_txt)
+                      print("[+] Added #include <linux/susfs.h> to fs/stat.c")
+                  elif decl_in_def and "#include <linux/susfs_def.h>" not in stat_txt:
+                      stat_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n" + stat_txt
+                      stat_path.write_text(stat_txt)
+                      print("[+] Added #include <linux/susfs_def.h> to fs/stat.c")
+          PYEOF
 
       - name: Locate pipa defconfig and inject SukiSU-Ultra + SUSFS + KPM flags
         working-directory: kernel
@@ -336,8 +408,26 @@ jobs:
             grep -q "^CONFIG_KSU_SUSFS=y$" out/.config
           fi
 
-          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image
+          set -o pipefail
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image 2>&1 | tee ../build.log
           file out/arch/arm64/boot/Image
+
+      - name: Extract and upload compiler errors (on failure)
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            grep -nE "error:|fatal error:" build.log | head -n 120 > compile-errors.txt || true
+            tail -n 150 build.log > build-tail.txt || true
+            cat compile-errors.txt || true
+          fi
+      - name: Upload compile error logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-error-logs
+          path: |
+            compile-errors.txt
+            build-tail.txt
 
       - name: Package Image-only AnyKernel3 zip (no dtb, no dtbo)
         run: |
