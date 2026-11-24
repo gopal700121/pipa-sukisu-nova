@@ -464,27 +464,33 @@ jobs:
               suc_path.write_text(suc_txt)
               print("[+] Fix 8b: Aligned ksu_handle_faccessat & ksu_handle_stat definitions in sucompat.c to const char __user **")
 
-          # Check lsm_hook.c for ksu_handle_setresuid registration
+          # Fix 8c: Under CONFIG_KSU_SUSFS, lsm_hook.c disables task_fix_setuid LSM hook (#ifndef CONFIG_KSU_SUSFS)
+          # and expects kernel/sys.c (__sys_setresuid) to call ksu_handle_setresuid(ruid, euid, suid) before commit_creds(new)
           if lsm_path.exists():
               lsm_txt = lsm_path.read_text()
-              has_lsm_reg = ("security_add_hooks" in lsm_txt and "task_fix_setuid" in lsm_txt)
-              print(f"[i] lsm_hook.c security_add_hooks + task_fix_setuid present: {has_lsm_reg}")
-              if not has_lsm_reg:
+              lsm_disabled_under_susfs = bool(re.search(r"#ifndef\s+CONFIG_KSU_SUSFS\s+LSM_HOOK_INIT\s*\(\s*task_fix_setuid", lsm_txt))
+              print(f"[i] lsm_hook.c task_fix_setuid disabled under CONFIG_KSU_SUSFS: {lsm_disabled_under_susfs}")
+              if lsm_disabled_under_susfs:
                   sys_c = pathlib.Path("kernel/sys.c")
                   if sys_c.exists():
                       stxt = sys_c.read_text()
                       if "ksu_handle_setresuid" not in stxt:
-                          anchor = "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)\n{"
-                          if anchor in stxt:
-                              assert stxt.count(anchor) == 1
-                              stxt = stxt.replace(
-                                  anchor,
-                                  "#ifdef CONFIG_KSU\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n"
-                                  + anchor + "\n#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif",
-                                  1
-                              )
-                              sys_c.write_text(stxt)
-                              print("[+] Fix 8c: Wired ksu_handle_setresuid into __sys_setresuid in kernel/sys.c")
+                          fn_anchor = "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)"
+                          hook_anchor = "\tretval = security_task_fix_setuid(new, old, LSM_SETID_RES);"
+                          assert stxt.count(fn_anchor) == 1, f"__sys_setresuid count: {stxt.count(fn_anchor)}"
+                          assert stxt.count(hook_anchor) == 1, f"security_task_fix_setuid(RES) count: {stxt.count(hook_anchor)}"
+                          stxt = stxt.replace(
+                              fn_anchor,
+                              "#ifdef CONFIG_KSU_SUSFS\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n" + fn_anchor,
+                              1
+                          )
+                          stxt = stxt.replace(
+                              hook_anchor,
+                              "#ifdef CONFIG_KSU_SUSFS\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n" + hook_anchor,
+                              1
+                          )
+                          sys_c.write_text(stxt)
+                          print("[+] Fix 8c: Wired ksu_handle_setresuid(ruid, euid, suid) into __sys_setresuid in kernel/sys.c")
           PYEOF
 
       - name: Audit SukiSU v3.0.0 hooks in kernel source
@@ -531,8 +537,8 @@ jobs:
               suh_txt = pathlib.Path("drivers/kernelsu/feature/sucompat.h").read_text()
               pp = suh_txt.split("#else")[0] if "#else" in suh_txt else suh_txt
 
-          h_fac_user = bool(re.search(r"ksu_handle_faccessat\s*\([^)]*const\s+char\s+__user\s*\*\*", pp))
-          h_stat_user = bool(re.search(r"ksu_handle_stat\s*\([^)]*const\s+char\s+__user\s*\*\*", pp))
+          h_fac_user = bool(re.search(r"ksu_handle_faccessat\s*\([^)]*const\s+char\s+(?:__user\s+)?\*\*", pp))
+          h_stat_user = bool(re.search(r"ksu_handle_stat\s*\([^)]*const\s+char\s+(?:__user\s+)?\*\*", pp))
           h_fac_fn = bool(re.search(r"ksu_handle_faccessat\s*\([^)]*struct\s+filename\s*\*\*", pp))
           h_stat_fn = bool(re.search(r"ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*", pp))
 
