@@ -260,24 +260,33 @@ jobs:
                   inc_path.write_text(text)
                   print("[+] Fix 1: Guarded <linux/static_call.h> in kernel_includes.h")
 
-          # Fix 2: Ensure CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER exists in Kconfig
+          # Fix 2: Ensure SUSFS v2.4.0 Kconfig options (PRIORITY_UID_FILTER & SUS_MAP) exist in Kconfig
           susfs_h = pathlib.Path("include/linux/susfs.h").read_text() if pathlib.Path("include/linux/susfs.h").exists() else ""
           susfs_def_h = pathlib.Path("include/linux/susfs_def.h").read_text() if pathlib.Path("include/linux/susfs_def.h").exists() else ""
           susfs_c = pathlib.Path("fs/susfs.c").read_text() if pathlib.Path("fs/susfs.c").exists() else ""
+          task_mmu_c = pathlib.Path("fs/proc/task_mmu.c").read_text() if pathlib.Path("fs/proc/task_mmu.c").exists() else ""
+          susfs_corpus = susfs_h + susfs_def_h + susfs_c + task_mmu_c
+
           kconfig_path = pathlib.Path("drivers/kernelsu/Kconfig")
           if kconfig_path.exists():
               kc = kconfig_path.read_text()
-              if ("KSU_SUSFS_PRIORITY_UID_FILTER" in (susfs_h + susfs_def_h + susfs_c)
-                      and "config KSU_SUSFS_PRIORITY_UID_FILTER" not in kc):
-                  stanza = (
-                      "\nconfig KSU_SUSFS_PRIORITY_UID_FILTER\n"
-                      "\tbool \"Enable SUSFS priority UID filter\"\n"
-                      "\tdepends on KSU_SUSFS\n"
-                      "\tdefault y\n"
-                  )
-                  kc = kc.replace("\nendmenu", stanza + "\nendmenu", 1) if "\nendmenu" in kc else (kc + stanza)
+              kc_modified = False
+              for sym, desc in [
+                  ("KSU_SUSFS_PRIORITY_UID_FILTER", "Enable SUSFS priority UID filter"),
+                  ("KSU_SUSFS_SUS_MAP", "Enable SUSFS memory map hiding"),
+              ]:
+                  if sym in susfs_corpus and f"config {sym}" not in kc:
+                      stanza = (
+                          f"\nconfig {sym}\n"
+                          f"\tbool \"{desc}\"\n"
+                          "\tdepends on KSU_SUSFS\n"
+                          "\tdefault y\n"
+                      )
+                      kc = kc.replace("\nendmenu", stanza + "\nendmenu", 1) if "\nendmenu" in kc else (kc + stanza)
+                      kc_modified = True
+                      print(f"[+] Fix 2: Added config {sym} to drivers/kernelsu/Kconfig")
+              if kc_modified:
                   kconfig_path.write_text(kc)
-                  print("[+] Fix 2: Added config KSU_SUSFS_PRIORITY_UID_FILTER to drivers/kernelsu/Kconfig")
 
           # Fix 3: Ensure fs/stat.c includes the header declaring susfs_is_current_app_uid
           stat_path = pathlib.Path("fs/stat.c")
@@ -328,7 +337,7 @@ jobs:
                   event_path.write_text(new_ev_txt)
                   print(f"[+] Fix 5: Replaced {count} strncpy_from_user_nofault() call(s) in sulog/event.c")
 
-          # Fix 6: Neutralize legacy ksu_handle_devpts call in fs/devpts/inode.c (not exported in SukiSU-Ultra v3.0.0)
+          # Fix 6: Neutralize legacy ksu_handle_devpts call in fs/devpts/inode.c (not exported in SukiSU v3.0.0)
           devpts_path = pathlib.Path("fs/devpts/inode.c")
           if devpts_path.exists():
               dp_txt = devpts_path.read_text()
@@ -341,6 +350,27 @@ jobs:
                   devpts_path.write_text("".join(dp_lines))
                   print("[+] Fix 6: Neutralized legacy ksu_handle_devpts in fs/devpts/inode.c")
           PYEOF
+
+      - name: Audit SukiSU v3.0.0 hooks in kernel source
+        working-directory: kernel
+        run: |
+          {
+            echo "=== Hooks defined/expected by drivers/kernelsu ==="
+            grep -rnE "ksu_handle_(sys_reboot|execveat|faccessat|stat|newfstat|setresuid)" drivers/kernelsu/ | head -n 50 || true
+            echo ""
+            echo "=== Hooks present in kernel/reboot.c, kernel/sys.c, fs/ ==="
+            grep -rnE "ksu_handle_|ksu_.*_hook" kernel/reboot.c kernel/sys.c fs/exec.c fs/open.c fs/stat.c fs/read_write.c 2>/dev/null || true
+          } | tee ../hook-audit.txt
+
+          if grep -rq "ksu_handle_sys_reboot" drivers/kernelsu/ 2>/dev/null; then
+            if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c 2>/dev/null; then
+              echo "::warning::drivers/kernelsu defines ksu_handle_sys_reboot, but kernel/reboot.c does NOT call it! Manager app may show Not Installed unless patched."
+              echo "MISSING_REBOOT_HOOK=true" >> "$GITHUB_ENV"
+            else
+              echo "[+] Verified: kernel/reboot.c calls ksu_handle_sys_reboot."
+              echo "MISSING_REBOOT_HOOK=false" >> "$GITHUB_ENV"
+            fi
+          fi
 
       - name: Locate pipa defconfig and inject SukiSU-Ultra + SUSFS + KPM flags
         working-directory: kernel
@@ -368,6 +398,7 @@ jobs:
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
           CONFIG_OVERLAY_FS=y
+          # CONFIG_TRIM_UNUSED_KSYMS is not set
           EOF
 
           if grep -q "config KSU_MANUAL_HOOK" drivers/kernelsu/Kconfig 2>/dev/null; then
@@ -395,10 +426,11 @@ jobs:
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
           CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
           EOF
           fi
 
-      - name: Compile kernel (Image only)
+      - name: Compile kernel (Image.gz only)
         working-directory: kernel
         run: |
           set -o pipefail
@@ -428,23 +460,25 @@ jobs:
           make "${MAKE_ARGS[@]}" "$DEFCONFIG"
 
           echo "[+] Auditing active KSU, SUSFS, KPM & LTO flags in out/.config:"
-          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|LTO)" out/.config | tee ../config-audit.txt
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|LTO|TRIM_UNUSED_KSYMS)" out/.config | tee ../config-audit.txt
 
           grep -q "^CONFIG_KSU=y$" out/.config
           grep -q "^CONFIG_KPM=y$" out/.config
           grep -q "^CONFIG_KALLSYMS_ALL=y$" out/.config
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
             grep -q "^CONFIG_KSU_SUSFS=y$" out/.config
+            grep -q "^CONFIG_KSU_SUSFS_SUS_MAP=y$" out/.config
           fi
 
-          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image 2>&1 | tee ../build.log
-          file out/arch/arm64/boot/Image
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image.gz 2>&1 | tee ../build.log
+          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz
+          file out/arch/arm64/boot/Image.gz
 
-      - name: Extract compiler errors (on failure)
+      - name: Extract compiler and linker errors (on failure)
         if: failure()
         run: |
           if [ -f build.log ]; then
-            grep -nE "error:|fatal error:|undefined symbol:" build.log | head -n 120 > compile-errors.txt || true
+            grep -nE "error:|fatal error:|undefined symbol:|duplicate symbol:|ld\.lld:" build.log | head -n 120 > compile-errors.txt || true
             tail -n 150 build.log > build-tail.txt || true
           fi
 
@@ -457,12 +491,12 @@ jobs:
             compile-errors.txt
             build-tail.txt
 
-      - name: Package Image-only AnyKernel3 zip (no dtb, no dtbo)
+      - name: Package Image.gz-only AnyKernel3 zip (no dtb, no dtbo)
         run: |
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
           rm -rf AnyKernel3/.git AnyKernel3/README.md AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
 
-          cp kernel/out/arch/arm64/boot/Image AnyKernel3/Image
+          cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
 
           cat << 'EOF' > AnyKernel3/anykernel.sh
           ### AnyKernel3 Ramdisk Mod Script
@@ -476,6 +510,8 @@ jobs:
           device.name1=pipa
           device.name2=pipa_pad_cn
           device.name3=23043RP34G
+          device.name4=pipa_global
+          device.name5=pipa_in
           supported.versions=13-16
           supported.patchlevels=
           '; }
@@ -491,7 +527,8 @@ jobs:
           flash_boot;
           EOF
 
-          test -s AnyKernel3/Image
+          test -s AnyKernel3/Image.gz
+          test ! -e AnyKernel3/Image
           test ! -e AnyKernel3/dtb
           test ! -e AnyKernel3/dtbo.img
 
@@ -500,10 +537,11 @@ jobs:
           zip -r9 "../$ZIP_NAME" ./*
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
-      - name: Upload AnyKernel3 artifact and config audit
+      - name: Upload AnyKernel3 artifact and audits
         uses: actions/upload-artifact@v4
         with:
           name: SukiSU-Ultra-KPM-SUSFS-pipa-r1-AnyKernel3
           path: |
             ${{ env.ZIP_NAME }}
             config-audit.txt
+            hook-audit.txt
