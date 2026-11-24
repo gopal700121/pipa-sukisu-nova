@@ -1,4 +1,4 @@
-name: Build SukiSU Nova + SUSFS AnyKernel3 (pipa r1)
+name: Build SukiSU-Ultra + SUSFS AnyKernel3 (pipa r1)
 
 on:
   workflow_dispatch:
@@ -19,18 +19,11 @@ on:
         required: false
         default: ''
       enable_susfs:
-        description: 'Apply SUSFS v2.x non-GKI 4.19 backport patches'
+        description: 'Ensure SUSFS 4.19 is present and enabled'
         type: boolean
         default: true
-      hook_mode:
-        description: 'KSU hook method (never mix both)'
-        type: choice
-        default: 'arm64_branch_link'
-        options:
-          - arm64_branch_link
-          - susfs_inline
       fail_on_patch_reject:
-        description: 'Stop immediately if susfs_patch_to_4.19.patch has unresolved .rej conflicts'
+        description: 'Stop if SUSFS patch has unresolved .rej conflicts'
         type: boolean
         default: true
 
@@ -81,31 +74,87 @@ jobs:
           rm -rf tmp_src kernel_src.zip
           ls -la kernel/Makefile
 
-      - name: Integrate SukiSU Nova (builtin branch)
+      - name: Detect existing SUSFS and KSU hooks in kernel source
         working-directory: kernel
         run: |
-          rm -rf KernelSU drivers/kernelsu
-          curl -fLSs "https://git.zako.shirkneko.top:20004/shirkneko/SukiSU/raw/branch/main/kernel/setup.sh" | bash -s builtin
+          if [ -f "fs/susfs.c" ] && [ -f "include/linux/susfs.h" ]; then
+            echo "[+] SUSFS is ALREADY included in this kernel source — will NOT re-patch SUSFS!"
+            grep -E "SUSFS_VERSION" include/linux/susfs.h || true
+            echo "SUSFS_ALREADY_PRESENT=true" >> "$GITHUB_ENV"
+          else
+            echo "[+] SUSFS is NOT included in this kernel source — will apply SUSFS 4.19 backport."
+            echo "SUSFS_ALREADY_PRESENT=false" >> "$GITHUB_ENV"
+          fi
 
-      - name: Apply SUSFS 4.19 non-GKI backport patches
+          if grep -q "ksu_handle_execveat" fs/exec.c 2>/dev/null; then
+            echo "[+] Manual KSU hooks are ALREADY present in kernel source."
+            echo "KSU_HOOKS_PRESENT=true" >> "$GITHUB_ENV"
+          else
+            echo "[+] Manual KSU hooks not detected — will apply inline hooks."
+            echo "KSU_HOOKS_PRESENT=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Integrate SukiSU-Ultra (GitHub, auto-select non-GKI branch)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          rm -rf KernelSU drivers/kernelsu
+
+          curl -fLSs --retry 3 \
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            -o ksu_setup.sh
+
+          if head -n 5 ksu_setup.sh | grep -qiE "<!DOCTYPE|<html"; then
+            echo "::error::Downloaded ksu_setup.sh is HTML, not a shell script!"
+            head -n 20 ksu_setup.sh
+            exit 1
+          fi
+
+          BRANCHES=$(git ls-remote --heads https://github.com/SukiSU-Ultra/SukiSU-Ultra.git | awk '{print $2}' | sed 's|refs/heads/||')
+          echo "[+] Available SukiSU-Ultra branches:"
+          echo "$BRANCHES"
+
+          TARGET_BRANCH=""
+          for b in nongki susfs-main builtin main; do
+            if echo "$BRANCHES" | grep -qx "$b"; then
+              TARGET_BRANCH="$b"
+              break
+            fi
+          done
+
+          echo "[+] Installing SukiSU-Ultra branch: ${TARGET_BRANCH:-default}"
+          if [ -n "$TARGET_BRANCH" ]; then
+            bash ksu_setup.sh "$TARGET_BRANCH"
+          else
+            bash ksu_setup.sh
+          fi
+          rm -f ksu_setup.sh
+
+          echo "[+] Checking drivers/kernelsu/Kconfig options:"
+          grep -E "^config (KSU|KPM)" drivers/kernelsu/Kconfig || true
+
+      - name: Apply SUSFS 4.19 patches and inline hooks (only if missing)
         if: ${{ inputs.enable_susfs }}
         working-directory: kernel
         run: |
           PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches"
 
-          echo "[+] Downloading susfs_patch_to_4.19.patch..."
-          curl -fLSs --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.19.patch" -o susfs_patch_to_4.19.patch
+          if [ "${{ env.SUSFS_ALREADY_PRESENT }}" = "true" ]; then
+            echo "[+] Skipping susfs_patch_to_4.19.patch because SUSFS is already in kernel source."
+          else
+            echo "[+] Downloading susfs_patch_to_4.19.patch..."
+            curl -fLSs --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.19.patch" -o susfs_patch_to_4.19.patch
 
-          echo "[+] Applying SUSFS 4.19 kernel patch..."
-          set +e
-          patch -p1 --fuzz=3 --forward < susfs_patch_to_4.19.patch
-          PATCH_RC=$?
-          set -e
-          rm -f susfs_patch_to_4.19.patch
+            echo "[+] Applying SUSFS 4.19 kernel patch..."
+            set +e
+            patch -p1 --fuzz=3 --forward < susfs_patch_to_4.19.patch
+            PATCH_RC=$?
+            set -e
+            rm -f susfs_patch_to_4.19.patch
 
-          if [ -f "fs/proc/task_mmu.c.rej" ]; then
-            echo "[+] Applying targeted fixup for fs/proc/task_mmu.c Hunk #7..."
-            python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+            if [ -f "fs/proc/task_mmu.c.rej" ]; then
+              echo "[+] Applying targeted fixup for fs/proc/task_mmu.c Hunk #7..."
+              python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
           from pathlib import Path
 
           path = Path("fs/proc/task_mmu.c")
@@ -145,39 +194,42 @@ jobs:
           for i in range(max(0, idx - 15), min(len(lines), idx + 10)):
               print(f"{i + 1}: {lines[i]}")
           PYEOF
-            if [ -z "$(find . -name '*.rej')" ]; then
-              PATCH_RC=0
+              if [ -z "$(find . -name '*.rej')" ]; then
+                PATCH_RC=0
+              fi
+            fi
+
+            REJ_FILES=$(find . -name "*.rej")
+            if [ -n "$REJ_FILES" ]; then
+              echo "::warning::Patch produced reject (.rej) files:"
+              echo "$REJ_FILES"
+              mkdir -p ../patch-rejects
+              for f in $REJ_FILES; do
+                cp --parents "$f" ../patch-rejects/
+                orig="${f%.rej}"
+                [ -f "$orig" ] && cp --parents "$orig" ../patch-rejects/
+              done
+              echo "HAS_REJECTS=true" >> "$GITHUB_ENV"
+              if [ "${{ inputs.fail_on_patch_reject }}" = "true" ]; then
+                echo "::error::Stopping due to patch rejects. Download 'susfs-patch-rejects' artifact to resolve them."
+                exit 1
+              fi
+            elif [ "$PATCH_RC" -ne 0 ]; then
+              echo "::error::patch exited with code $PATCH_RC without .rej files."
+              exit "$PATCH_RC"
             fi
           fi
 
-          REJ_FILES=$(find . -name "*.rej")
-          if [ -n "$REJ_FILES" ]; then
-            echo "::warning::Patch produced reject (.rej) files:"
-            echo "$REJ_FILES"
-            mkdir -p ../patch-rejects
-            for f in $REJ_FILES; do
-              cp --parents "$f" ../patch-rejects/
-              orig="${f%.rej}"
-              [ -f "$orig" ] && cp --parents "$orig" ../patch-rejects/
-            done
-            echo "HAS_REJECTS=true" >> "$GITHUB_ENV"
-            if [ "${{ inputs.fail_on_patch_reject }}" = "true" ]; then
-              echo "::error::Stopping due to patch rejects. Download 'susfs-patch-rejects' artifact to resolve them."
-              exit 1
-            fi
-          elif [ "$PATCH_RC" -ne 0 ]; then
-            echo "::error::patch exited with code $PATCH_RC without .rej files."
-            exit "$PATCH_RC"
-          fi
-
-          if [ "${{ inputs.hook_mode }}" = "susfs_inline" ]; then
-            echo "[+] Applying SUSFS inline hook script..."
+          if [ "${{ env.KSU_HOOKS_PRESENT }}" = "true" ]; then
+            echo "[+] Skipping susfs_inline_hook_patches.sh because KSU hooks are already in kernel source."
+          else
+            echo "[+] Applying SUSFS inline hook script for non-GKI 4.19..."
             curl -fLSs --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o susfs_inline_hook_patches.sh
             bash susfs_inline_hook_patches.sh
             rm -f susfs_inline_hook_patches.sh
           fi
 
-          echo "[+] Verifying SUSFS source files exist..."
+          echo "[+] Verifying SUSFS source files exist:"
           ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
 
       - name: Upload patch rejects (on conflict)
@@ -187,7 +239,7 @@ jobs:
           name: susfs-patch-rejects
           path: patch-rejects/
 
-      - name: Locate pipa defconfig and inject SukiSU Nova + SUSFS + KPM flags
+      - name: Locate pipa defconfig and inject SukiSU-Ultra + SUSFS + KPM flags
         working-directory: kernel
         run: |
           DEFCONFIG="${{ inputs.defconfig }}"
@@ -207,7 +259,7 @@ jobs:
           CFG_FILE="arch/arm64/configs/$DEFCONFIG"
           cat << 'EOF' >> "$CFG_FILE"
 
-          # SukiSU Nova (4.19 ARM64 builtin + KPM)
+          # SukiSU-Ultra (4.19 non-GKI + KPM)
           CONFIG_KSU=y
           CONFIG_KPM=y
           CONFIG_KALLSYMS=y
@@ -215,14 +267,18 @@ jobs:
           CONFIG_OVERLAY_FS=y
           EOF
 
-          if [ "${{ inputs.hook_mode }}" = "arm64_branch_link" ]; then
-            echo "CONFIG_KSU_HACK_ARM64_BRANCH_LINK=y" >> "$CFG_FILE"
+          # Enable manual hooks and disable kprobes hook when supported by Kconfig
+          if grep -q "config KSU_MANUAL_HOOK" drivers/kernelsu/Kconfig 2>/dev/null; then
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CFG_FILE"
+          fi
+          if grep -q "config KSU_KPROBES_HOOK" drivers/kernelsu/Kconfig 2>/dev/null; then
+            echo "# CONFIG_KSU_KPROBES_HOOK is not set" >> "$CFG_FILE"
           fi
 
           if [ "${{ inputs.enable_susfs }}" = "true" ]; then
             cat << 'EOF' >> "$CFG_FILE"
 
-          # SUSFS v2.x options
+          # SUSFS options
           CONFIG_KSU_SUSFS=y
           CONFIG_KSU_SUSFS_SUS_PATH=y
           CONFIG_KSU_SUSFS_SUS_MOUNT=y
@@ -236,8 +292,10 @@ jobs:
           CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
           CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
           CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
-          CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
           EOF
+            if grep -q "config KSU_SUSFS_PRIORITY_UID_FILTER" drivers/kernelsu/Kconfig 2>/dev/null; then
+              echo "CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y" >> "$CFG_FILE"
+            fi
           fi
 
       - name: Compile kernel (Image only)
@@ -271,7 +329,6 @@ jobs:
           echo "[+] Auditing active KSU, SUSFS, KPM & LTO flags in out/.config:"
           grep -E "^CONFIG_(KSU|KPM|KALLSYMS|LTO)" out/.config | tee ../config-audit.txt
 
-          # Hard-assert required features are enabled before compiling
           grep -q "^CONFIG_KSU=y$" out/.config
           grep -q "^CONFIG_KPM=y$" out/.config
           grep -q "^CONFIG_KALLSYMS_ALL=y$" out/.config
@@ -292,7 +349,7 @@ jobs:
           cat << 'EOF' > AnyKernel3/anykernel.sh
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=SukiSU-Nova-SUSFS-pipa-r1
+          kernel.string=SukiSU-Ultra-SUSFS-pipa-r1
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -316,20 +373,19 @@ jobs:
           flash_boot;
           EOF
 
-          # Safety assertions: Image must exist, dtb/dtbo must NOT exist
           test -s AnyKernel3/Image
           test ! -e AnyKernel3/dtb
           test ! -e AnyKernel3/dtbo.img
 
           cd AnyKernel3
-          ZIP_NAME="SukiSU-Nova-SUSFS-pipa-r1-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
+          ZIP_NAME="SukiSU-Ultra-SUSFS-pipa-r1-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
           zip -r9 "../$ZIP_NAME" ./*
           echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
 
       - name: Upload AnyKernel3 artifact and config audit
         uses: actions/upload-artifact@v4
         with:
-          name: SukiSU-Nova-SUSFS-pipa-r1-AnyKernel3
+          name: SukiSU-Ultra-SUSFS-pipa-r1-AnyKernel3
           path: |
             ${{ env.ZIP_NAME }}
             config-audit.txt
