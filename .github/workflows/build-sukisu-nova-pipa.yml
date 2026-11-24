@@ -337,6 +337,19 @@ jobs:
                   print(f"[+] Replaced {count} call(s) to strncpy_from_user_nofault in drivers/kernelsu/sulog/event.c")
               else:
                   print("[!] No bare strncpy_from_user_nofault() calls found in sulog/event.c")
+
+          # Fix 6: Neutralize legacy ksu_handle_devpts call in fs/devpts/inode.c
+          devpts_path = pathlib.Path("fs/devpts/inode.c")
+          if devpts_path.exists():
+            dp_txt = devpts_path.read_text()
+            if "ksu_handle_devpts" in dp_txt:
+              dp_lines = [
+                  ("// " + l if "extern" in l else re.sub(r"ksu_handle_devpts\s*\(", "(void)(", l))
+                  if "ksu_handle_devpts" in l else l
+                  for l in dp_txt.splitlines(keepends=True)
+                  ]
+                  devpts_path.write_text("".join(dp_lines))
+                  print("[+] Neutralized legacy ksu_handle_devpts in fs/devpts/inode.c")
           PYEOF
 
       - name: Locate pipa defconfig and inject SukiSU-Ultra + SUSFS + KPM flags
