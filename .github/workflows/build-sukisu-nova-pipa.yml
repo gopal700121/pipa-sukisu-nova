@@ -349,6 +349,27 @@ jobs:
                   ]
                   devpts_path.write_text("".join(dp_lines))
                   print("[+] Fix 6: Neutralized legacy ksu_handle_devpts in fs/devpts/inode.c")
+          # Fix 7: Wire ksu_handle_sys_reboot in kernel/reboot.c before CAP_SYS_BOOT check for SukiSU v3.0.0
+          reboot_path = pathlib.Path("kernel/reboot.c")
+          if reboot_path.exists():
+              rb_txt = reboot_path.read_text()
+              if "ksu_handle_sys_reboot" not in rb_txt:
+                  sysc_anchor = "SYSCALL_DEFINE4(reboot,"
+                  cap_anchor = "\tif (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))"
+                  assert rb_txt.count(sysc_anchor) == 1, f"SYSCALL_DEFINE4(reboot) count: {rb_txt.count(sysc_anchor)}"
+                  assert rb_txt.count(cap_anchor) == 1, f"ns_capable anchor count: {rb_txt.count(cap_anchor)}"
+                  rb_txt = rb_txt.replace(
+                      sysc_anchor,
+                      "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n" + sysc_anchor,
+                      1
+                  )
+                  rb_txt = rb_txt.replace(
+                      cap_anchor,
+                      "#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n" + cap_anchor,
+                      1
+                  )
+                  reboot_path.write_text(rb_txt)
+                  print("[+] Fix 7: Wired ksu_handle_sys_reboot() into SYSCALL_DEFINE4(reboot) in kernel/reboot.c")
           PYEOF
 
       - name: Audit SukiSU v3.0.0 hooks in kernel source
