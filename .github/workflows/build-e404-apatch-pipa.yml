@@ -76,14 +76,15 @@ jobs:
 
           # Remove any CONFIG_KSU* / CONFIG_KPM* lines from defconfig and force CONFIG_KSU off
           CFG_FILE="arch/arm64/configs/${{ inputs.defconfig }}"
-          sed -i '/CONFIG_KSU/d; /CONFIG_KPM/d' "$CFG_FILE"
+          sed -i '/CONFIG_KSU/d; /CONFIG_KPM/d; /CONFIG_DEBUG_KERNEL/d; /CONFIG_KALLSYMS/d' "$CFG_FILE"
 
           cat << 'EOF' >> "$CFG_FILE"
 
           # Strip all KernelSU / RKSU / SukiSU (APatch-only clean kernel)
           # CONFIG_KSU is not set
 
-          # Required kernel configs for APatch / KernelPatch + KPM
+          # Required kernel configs for APatch / KernelPatch + KPM (KALLSYMS_ALL depends on DEBUG_KERNEL)
+          CONFIG_DEBUG_KERNEL=y
           CONFIG_KALLSYMS=y
           CONFIG_KALLSYMS_ALL=y
           CONFIG_OVERLAY_FS=y
