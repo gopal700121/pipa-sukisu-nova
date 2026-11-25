@@ -1,0 +1,647 @@
+name: Build E404 + SukiSU-Ultra + KPM + SUSFS AnyKernel3 (pipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_repo:
+        description: 'Official E404 Kernel git URL'
+        required: true
+        default: 'https://github.com/kvsnr113/xiaomi_sm8250_kernel_e404.git'
+      kernel_branch:
+        description: 'E404 branch name'
+        required: true
+        default: 'main'
+      clang_rev:
+        description: 'Google AOSP Clang revision (native MLGO support)'
+        type: choice
+        default: 'clang-r522817'
+        options:
+          - clang-r522817
+          - clang-r547379
+      defconfig:
+        description: 'Defconfig path'
+        required: false
+        default: 'vendor/pipa_defconfig'
+      enable_susfs:
+        description: 'Ensure SUSFS 4.19 is present and enabled'
+        type: boolean
+        default: true
+      fail_on_patch_reject:
+        description: 'Stop if SUSFS patch has unresolved .rej conflicts'
+        type: boolean
+        default: true
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev \
+            libelf-dev cpio zip unzip curl wget git python-is-python3 patch file \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Download & verify Google AOSP Clang (MLGO)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOWNLOADED=0
+          for REV in "${{ inputs.clang_rev }}" "clang-r547379" "clang-r522817"; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${REV}.tar.gz"
+            echo "[+] Trying AOSP Clang: $REV"
+            if curl -fL --retry 3 "$URL" -o clang.tar.gz; then
+              rm -rf "$HOME/clang" && mkdir -p "$HOME/clang"
+              tar -xzf clang.tar.gz -C "$HOME/clang"
+              rm -f clang.tar.gz
+              if "$HOME/clang/bin/clang" -mllvm -regalloc-enable-advisor=release -x c -c /dev/null -o /dev/null; then
+                echo "[+] Verified $REV with native MLGO support:"
+                "$HOME/clang/bin/clang" --version
+                DOWNLOADED=1
+                break
+              fi
+            fi
+          done
+          if [ "$DOWNLOADED" -ne 1 ]; then
+            echo "::error::Failed to download a working AOSP Clang with MLGO support."
+            exit 1
+          fi
+
+      - name: Clone official E404 Kernel source
+        run: |
+          git clone --depth=1 -b "${{ inputs.kernel_branch }}" "${{ inputs.kernel_repo }}" kernel
+          git -C kernel log -1 --oneline
+          ls -la kernel/Makefile "kernel/arch/arm64/configs/${{ inputs.defconfig }}"
+
+      - name: Detect existing SUSFS and KSU hooks in E404 source
+        working-directory: kernel
+        run: |
+          if [ -f "fs/susfs.c" ] && [ -f "include/linux/susfs.h" ]; then
+            echo "[+] SUSFS is ALREADY included in E404 source — skipping SUSFS kernel patch."
+            grep -E "SUSFS_VERSION" include/linux/susfs.h || true
+            echo "SUSFS_ALREADY_PRESENT=true" >> "$GITHUB_ENV"
+          else
+            echo "[+] SUSFS is NOT included in E404 source — will apply SUSFS 4.19 backport."
+            echo "SUSFS_ALREADY_PRESENT=false" >> "$GITHUB_ENV"
+          fi
+
+          if grep -q "ksu_handle_execveat" fs/exec.c 2>/dev/null; then
+            echo "[+] Manual KSU hooks are ALREADY present in E404 source."
+            echo "KSU_HOOKS_PRESENT=true" >> "$GITHUB_ENV"
+          else
+            echo "[+] Manual KSU hooks not detected — will apply inline hooks."
+            echo "KSU_HOOKS_PRESENT=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Strip RKSU and install SukiSU-Ultra (builtin branch)
+        working-directory: kernel
+        run: |
+          set -euo pipefail
+          rm -rf KernelSU RKSU drivers/kernelsu
+          sed -i '/kernelsu/d' drivers/Makefile drivers/Kconfig || true
+
+          curl -fLSs --retry 3 \
+            "https://raw.githubusercontent.com/SukiSU-Ultra/SukiSU-Ultra/main/kernel/setup.sh" \
+            -o ksu_setup.sh
+
+          if head -n 5 ksu_setup.sh | grep -qiE "<!DOCTYPE|<html"; then
+            echo "::error::Downloaded ksu_setup.sh is HTML, not a shell script!"
+            head -n 20 ksu_setup.sh
+            exit 1
+          fi
+
+          bash ksu_setup.sh builtin
+          rm -f ksu_setup.sh
+
+          echo "[+] Checking drivers/kernelsu/Kconfig:"
+          grep -E "^config (KSU|KPM)" drivers/kernelsu/Kconfig || true
+
+      - name: Apply SUSFS 4.19 patches and inline hooks (only if missing)
+        if: ${{ inputs.enable_susfs }}
+        working-directory: kernel
+        run: |
+          PATCH_BASE="https://raw.githubusercontent.com/JackA1ltman/NonGKI_Kernel_Build_2nd/refs/heads/mainline/Patches"
+
+          if [ "${{ env.SUSFS_ALREADY_PRESENT }}" = "true" ]; then
+            echo "[+] Skipping susfs_patch_to_4.19.patch (already in source)."
+          else
+            echo "[+] Downloading susfs_patch_to_4.19.patch..."
+            curl -fLSs --retry 3 "${PATCH_BASE}/Patch/susfs_patch_to_4.19.patch" -o susfs_patch_to_4.19.patch
+
+            echo "[+] Applying SUSFS 4.19 kernel patch..."
+            set +e
+            patch -p1 --fuzz=3 --forward < susfs_patch_to_4.19.patch
+            PATCH_RC=$?
+            set -e
+            rm -f susfs_patch_to_4.19.patch
+
+            if [ -f "fs/proc/task_mmu.c.rej" ]; then
+              echo "[+] Checking fs/proc/task_mmu.c.rej for 5-arg walk_page_range fixup..."
+              python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+          from pathlib import Path
+          path = Path("fs/proc/task_mmu.c")
+          content = path.read_text()
+          target = (
+              "\t\tret = down_read_killable(&mm->mmap_sem);\n"
+              "\t\tif (ret)\n"
+              "\t\t\tgoto out_free;\n"
+              "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
+              "\t\tup_read(&mm->mmap_sem);\n"
+          )
+          replacement = (
+              "\t\tret = down_read_killable(&mm->mmap_sem);\n"
+              "\t\tif (ret)\n"
+              "\t\t\tgoto out_free;\n"
+              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+              "\t\tvma = find_vma(mm, start_vaddr);\n"
+              "\t\tif (vma && vma->vm_file && SUSFS_IS_INODE_SUS_MAP(file_inode(vma->vm_file)))\n"
+              "\t\t\tgoto bypass_orig_flow;\n"
+              "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+              "\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
+              "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+              "bypass_orig_flow:\n"
+              "#endif // #ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
+              "\t\tup_read(&mm->mmap_sem);\n"
+          )
+          if content.count(target) == 1:
+              path.write_text(content.replace(target, replacement, 1))
+              Path("fs/proc/task_mmu.c.rej").unlink()
+              print("[+] Applied targeted fixup for fs/proc/task_mmu.c Hunk #7")
+          PYEOF
+              if [ -z "$(find . -name '*.rej')" ]; then
+                PATCH_RC=0
+              fi
+            fi
+
+            REJ_FILES=$(find . -name "*.rej")
+            if [ -n "$REJ_FILES" ]; then
+              echo "::warning::Patch produced reject (.rej) files:"
+              echo "$REJ_FILES"
+              mkdir -p ../patch-rejects
+              for f in $REJ_FILES; do
+                cp --parents "$f" ../patch-rejects/
+                orig="${f%.rej}"
+                [ -f "$orig" ] && cp --parents "$orig" ../patch-rejects/
+              done
+              echo "HAS_REJECTS=true" >> "$GITHUB_ENV"
+              if [ "${{ inputs.fail_on_patch_reject }}" = "true" ]; then
+                echo "::error::Stopping due to patch rejects. Download 'susfs-patch-rejects' artifact to resolve them."
+                exit 1
+              fi
+            elif [ "$PATCH_RC" -ne 0 ]; then
+              echo "::error::patch exited with code $PATCH_RC without .rej files."
+              exit "$PATCH_RC"
+            fi
+          fi
+
+          if [ "${{ env.KSU_HOOKS_PRESENT }}" = "true" ]; then
+            echo "[+] Skipping susfs_inline_hook_patches.sh (hooks already in source)."
+          else
+            echo "[+] Applying SUSFS inline hook script..."
+            curl -fLSs --retry 3 "${PATCH_BASE}/susfs_inline_hook_patches.sh" -o susfs_inline_hook_patches.sh
+            bash susfs_inline_hook_patches.sh
+            rm -f susfs_inline_hook_patches.sh
+          fi
+
+          echo "[+] Verifying SUSFS source files:"
+          ls -la fs/susfs.c include/linux/susfs.h include/linux/susfs_def.h
+
+      - name: Upload patch rejects (on conflict)
+        if: failure() && env.HAS_REJECTS == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: susfs-patch-rejects
+          path: patch-rejects/
+
+      - name: Apply Linux 4.19 & SukiSU v3.0.0 compat + ABI fixes
+        working-directory: kernel
+        run: |
+          python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+          import pathlib, re
+
+          # Fix 1: Guard #include <linux/static_call.h> for kernels < 5.10
+          inc_path = pathlib.Path("drivers/kernelsu/kernel_includes.h")
+          if inc_path.exists():
+              text = inc_path.read_text()
+              needle = "#include <linux/static_call.h>"
+              if needle in text and "KERNEL_VERSION(5, 10, 0)" not in text.split(needle)[0][-120:]:
+                  replacement = (
+                      "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n"
+                      "#include <linux/static_call.h>\n"
+                      "#endif"
+                  )
+                  inc_path.write_text(text.replace(needle, replacement, 1))
+                  print("[+] Fix 1: Guarded <linux/static_call.h> in kernel_includes.h")
+
+          # Fix 2: Ensure SUSFS v2.4.0 Kconfig options exist in drivers/kernelsu/Kconfig
+          susfs_h = pathlib.Path("include/linux/susfs.h").read_text() if pathlib.Path("include/linux/susfs.h").exists() else ""
+          susfs_def_h = pathlib.Path("include/linux/susfs_def.h").read_text() if pathlib.Path("include/linux/susfs_def.h").exists() else ""
+          susfs_c = pathlib.Path("fs/susfs.c").read_text() if pathlib.Path("fs/susfs.c").exists() else ""
+          task_mmu_c = pathlib.Path("fs/proc/task_mmu.c").read_text() if pathlib.Path("fs/proc/task_mmu.c").exists() else ""
+          susfs_corpus = susfs_h + susfs_def_h + susfs_c + task_mmu_c
+
+          kconfig_path = pathlib.Path("drivers/kernelsu/Kconfig")
+          if kconfig_path.exists():
+              kc = kconfig_path.read_text()
+              kc_modified = False
+              for sym, desc in [
+                  ("KSU_SUSFS_PRIORITY_UID_FILTER", "Enable SUSFS priority UID filter"),
+                  ("KSU_SUSFS_SUS_MAP", "Enable SUSFS memory map hiding"),
+              ]:
+                  if sym in susfs_corpus and f"config {sym}" not in kc:
+                      stanza = f"\nconfig {sym}\n\tbool \"{desc}\"\n\tdepends on KSU_SUSFS\n\tdefault y\n"
+                      kc = kc.replace("\nendmenu", stanza + "\nendmenu", 1) if "\nendmenu" in kc else (kc + stanza)
+                      kc_modified = True
+                      print(f"[+] Fix 2: Added config {sym} to drivers/kernelsu/Kconfig")
+              if kc_modified:
+                  kconfig_path.write_text(kc)
+
+          # Fix 3: Ensure fs/stat.c includes the header declaring susfs_is_current_app_uid
+          stat_path = pathlib.Path("fs/stat.c")
+          if stat_path.exists():
+              stat_txt = stat_path.read_text()
+              if "susfs_is_current_app_uid" in stat_txt:
+                  decl_in_susfs = "susfs_is_current_app_uid" in susfs_h
+                  decl_in_def = "susfs_is_current_app_uid" in susfs_def_h
+                  if decl_in_susfs and "#include <linux/susfs.h>" not in stat_txt:
+                      stat_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs.h>\n#endif\n" + stat_txt
+                      stat_path.write_text(stat_txt)
+                      print("[+] Fix 3: Added #include <linux/susfs.h> to fs/stat.c")
+                  elif decl_in_def and "#include <linux/susfs_def.h>" not in stat_txt:
+                      stat_txt = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n" + stat_txt
+                      stat_path.write_text(stat_txt)
+                      print("[+] Fix 3: Added #include <linux/susfs_def.h> to fs/stat.c")
+
+          # Fix 4: Linux < 5.0 3-argument access_ok(VERIFY_WRITE, addr, size) in kpm.c
+          kpm_path = pathlib.Path("drivers/kernelsu/extension/kpm/kpm.c")
+          if kpm_path.exists():
+              kpm_txt = kpm_path.read_text()
+              old_call = "access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))"
+              if old_call in kpm_txt:
+                  kpm_path.write_text(kpm_txt.replace(
+                      old_call, "access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))"
+                  ))
+                  print("[+] Fix 4: Patched 3-arg access_ok() in kpm.c")
+
+          # Fix 5: Replace bare strncpy_from_user_nofault( with __strncpy_from_user_nofault( in sulog/event.c & sucompat.c
+          for frel in ["drivers/kernelsu/sulog/event.c", "drivers/kernelsu/feature/sucompat.c"]:
+              fp = pathlib.Path(frel)
+              if fp.exists():
+                  ftxt = fp.read_text()
+                  new_ftxt, cnt = re.subn(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', ftxt)
+                  if cnt > 0:
+                      fp.write_text(new_ftxt)
+                      print(f"[+] Fix 5: Replaced {cnt} strncpy_from_user_nofault() call(s) in {frel}")
+
+          # Fix 6: Neutralize legacy ksu_handle_devpts in fs/devpts/inode.c
+          devpts_path = pathlib.Path("fs/devpts/inode.c")
+          if devpts_path.exists():
+              dp_txt = devpts_path.read_text()
+              if "ksu_handle_devpts" in dp_txt:
+                  dp_lines = [
+                      ("// " + l if "extern" in l else re.sub(r"ksu_handle_devpts\s*\(", "(void)(", l))
+                      if "ksu_handle_devpts" in l else l
+                      for l in dp_txt.splitlines(keepends=True)
+                  ]
+                  devpts_path.write_text("".join(dp_lines))
+                  print("[+] Fix 6: Neutralized legacy ksu_handle_devpts in fs/devpts/inode.c")
+
+          # Fix 7: Wire ksu_handle_sys_reboot in kernel/reboot.c before CAP_SYS_BOOT check if missing
+          reboot_path = pathlib.Path("kernel/reboot.c")
+          if reboot_path.exists():
+              rb_txt = reboot_path.read_text()
+              if "ksu_handle_sys_reboot" not in rb_txt:
+                  sysc_anchor = "SYSCALL_DEFINE4(reboot,"
+                  cap_anchor = "\tif (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))"
+                  assert rb_txt.count(sysc_anchor) == 1 and rb_txt.count(cap_anchor) == 1
+                  rb_txt = rb_txt.replace(
+                      sysc_anchor,
+                      "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n" + sysc_anchor,
+                      1
+                  )
+                  rb_txt = rb_txt.replace(
+                      cap_anchor,
+                      "#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n" + cap_anchor,
+                      1
+                  )
+                  reboot_path.write_text(rb_txt)
+                  print("[+] Fix 7: Wired ksu_handle_sys_reboot() into kernel/reboot.c")
+
+          # Fix 8: Align sucompat.h/sucompat.c ABI with fs/open.c & fs/stat.c if callers pass const char __user **
+          open_c = pathlib.Path("fs/open.c").read_text() if pathlib.Path("fs/open.c").exists() else ""
+          stat_c_txt = pathlib.Path("fs/stat.c").read_text() if pathlib.Path("fs/stat.c").exists() else ""
+          open_uses_user = bool(re.search(r"extern\s+int\s+ksu_handle_faccessat\s*\([^)]*const\s+char\s+__user\s*\*\*", open_c))
+          stat_uses_user = bool(re.search(r"extern\s+int\s+ksu_handle_stat\s*\([^)]*const\s+char\s+__user\s*\*\*", stat_c_txt))
+          print(f"[i] Caller ABI check: fs/open.c user_ptr={open_uses_user}, fs/stat.c user_ptr={stat_uses_user}")
+
+          suh_path = pathlib.Path("drivers/kernelsu/feature/sucompat.h")
+          suc_path = pathlib.Path("drivers/kernelsu/feature/sucompat.c")
+          if (open_uses_user or stat_uses_user) and suh_path.exists() and suc_path.exists():
+              suh_txt = suh_path.read_text()
+              old_h_fac = "int ksu_handle_faccessat(int *dfd, struct filename **filename, int *mode, int *__unused_flags);"
+              new_h_fac = "int ksu_handle_faccessat(int *dfd, const char __user **filename_user, int *mode, int *__unused_flags);"
+              old_h_stat = "int ksu_handle_stat(int *dfd, struct filename **filename, int *flags);"
+              new_h_stat = "int ksu_handle_stat(int *dfd, const char __user **filename_user, int *flags);"
+              if open_uses_user and old_h_fac in suh_txt:
+                  suh_txt = suh_txt.replace(old_h_fac, new_h_fac, 1)
+              if stat_uses_user and old_h_stat in suh_txt:
+                  suh_txt = suh_txt.replace(old_h_stat, new_h_stat, 1)
+              suh_path.write_text(suh_txt)
+              print("[+] Fix 8a: Aligned sucompat.h prototypes to const char __user **")
+
+              def extract_c_func(src, sig_regex):
+                  m = re.search(sig_regex, src, re.MULTILINE)
+                  if not m:
+                      return None
+                  start = m.start()
+                  brace = src.find("{", m.end() - 1)
+                  depth = 0
+                  i = brace
+                  while i < len(src):
+                      if src[i] == "{":
+                          depth += 1
+                      elif src[i] == "}":
+                          depth -= 1
+                          if depth == 0:
+                              return (start, i + 1, src[start:i + 1])
+                      i += 1
+                  return None
+
+              suc_txt = suc_path.read_text()
+              user_fac = extract_c_func(suc_txt, r"^int\s+ksu_handle_faccessat\s*\([^)]*const\s+char\s+__user\s*\*\*[^)]*\)\s*\{")
+              user_stat = extract_c_func(suc_txt, r"^int\s+ksu_handle_stat\s*\([^)]*const\s+char\s+__user\s*\*\*[^)]*\)\s*\{")
+              sus_fac = extract_c_func(suc_txt, r"^int\s+ksu_handle_faccessat\s*\([^)]*struct\s+filename\s*\*\*[^)]*\)\s*\{")
+              sus_stat = extract_c_func(suc_txt, r"^int\s+ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*[^)]*\)\s*\{")
+              if user_fac and user_stat and sus_fac and sus_stat:
+                  else_pos = suc_txt.rfind("#else", 0, user_fac[0])
+                  extra_helpers = ""
+                  if else_pos != -1:
+                      between = suc_txt[else_pos:user_fac[0]]
+                      extra_helpers = between.split("\n", 1)[1].strip() + "\n\n"
+                  new_fac = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', user_fac[2])
+                  new_stat = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', user_stat[2])
+                  extra_helpers = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', extra_helpers)
+                  if sus_stat[0] > sus_fac[0]:
+                      suc_txt = suc_txt[:sus_stat[0]] + new_stat + suc_txt[sus_stat[1]:]
+                      suc_txt = suc_txt[:sus_fac[0]] + extra_helpers + new_fac + suc_txt[sus_fac[1]:]
+                  else:
+                      suc_txt = suc_txt[:sus_fac[0]] + extra_helpers + new_fac + suc_txt[sus_fac[1]:]
+                      sus_stat2 = extract_c_func(suc_txt, r"^int\s+ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*[^)]*\)\s*\{")
+                      suc_txt = suc_txt[:sus_stat2[0]] + new_stat + suc_txt[sus_stat2[1]:]
+                  suc_path.write_text(suc_txt)
+                  print("[+] Fix 8b: Aligned sucompat.c definitions + copied #else helper block")
+
+          # Fix 8c: Wire ksu_handle_setresuid into kernel/sys.c if lsm_hook.c disables task_fix_setuid under CONFIG_KSU_SUSFS
+          lsm_path = pathlib.Path("drivers/kernelsu/hook/lsm_hook.c")
+          if lsm_path.exists():
+              lsm_txt = lsm_path.read_text()
+              if re.search(r"#ifndef\s+CONFIG_KSU_SUSFS\s+LSM_HOOK_INIT\s*\(\s*task_fix_setuid", lsm_txt):
+                  sys_c = pathlib.Path("kernel/sys.c")
+                  if sys_c.exists():
+                      stxt = sys_c.read_text()
+                      if "ksu_handle_setresuid" not in stxt:
+                          fn_anchor = "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)"
+                          hook_anchor = "\tretval = security_task_fix_setuid(new, old, LSM_SETID_RES);"
+                          if stxt.count(fn_anchor) == 1 and stxt.count(hook_anchor) == 1:
+                              stxt = stxt.replace(
+                                  fn_anchor,
+                                  "#ifdef CONFIG_KSU_SUSFS\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n" + fn_anchor,
+                                  1
+                              )
+                              stxt = stxt.replace(
+                                  hook_anchor,
+                                  "#ifdef CONFIG_KSU_SUSFS\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n" + hook_anchor,
+                                  1
+                              )
+                              sys_c.write_text(stxt)
+                              print("[+] Fix 8c: Wired ksu_handle_setresuid into __sys_setresuid in kernel/sys.c")
+          PYEOF
+
+      - name: Audit SukiSU v3.0.0 hooks and enforce ABI gate
+        working-directory: kernel
+        run: |
+          {
+            echo "=== Callers in fs/open.c, fs/stat.c, fs/exec.c ==="
+            grep -nE "ksu_handle_(faccessat|stat|execveat)" fs/open.c fs/stat.c fs/exec.c 2>/dev/null || true
+            echo ""
+            echo "=== Active CONFIG_KSU_SUSFS=1 preprocessed prototypes (sucompat.h) ==="
+            "$HOME/clang/bin/clang" -E -P -DCONFIG_KSU=1 -DCONFIG_KSU_SUSFS=1 -Iinclude -Idrivers/kernelsu drivers/kernelsu/feature/sucompat.h 2>/dev/null | grep -E "ksu_handle_(faccessat|stat|execveat)" || true
+            echo ""
+            echo "=== ksu_handle_setresuid in kernel/sys.c ==="
+            grep -n "ksu_handle_setresuid" kernel/sys.c 2>/dev/null || echo "(none in kernel/sys.c)"
+            echo ""
+            echo "=== ksu_handle_sys_reboot in kernel/reboot.c ==="
+            grep -n "ksu_handle_sys_reboot" kernel/reboot.c 2>/dev/null || echo "(none in kernel/reboot.c)"
+          } | tee ../hook-audit.txt
+
+          python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+          import pathlib, re, subprocess, os
+
+          open_c = pathlib.Path("fs/open.c").read_text()
+          stat_c = pathlib.Path("fs/stat.c").read_text()
+          open_uses_user = bool(re.search(r"extern\s+int\s+ksu_handle_faccessat\s*\([^)]*const\s+char\s+__user\s*\*\*", open_c))
+          stat_uses_user = bool(re.search(r"extern\s+int\s+ksu_handle_stat\s*\([^)]*const\s+char\s+__user\s*\*\*", stat_c))
+          open_uses_fn = bool(re.search(r"extern\s+int\s+ksu_handle_faccessat\s*\([^)]*struct\s+filename\s*\*\*", open_c))
+          stat_uses_fn = bool(re.search(r"extern\s+int\s+ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*", stat_c))
+
+          clang_bin = os.path.expanduser("~/clang/bin/clang")
+          pp = subprocess.run(
+              [clang_bin, "-E", "-P", "-DCONFIG_KSU=1", "-DCONFIG_KSU_SUSFS=1", "-Iinclude", "-Idrivers/kernelsu", "drivers/kernelsu/feature/sucompat.h"],
+              capture_output=True, text=True
+          ).stdout
+          if "ksu_handle_faccessat" not in pp:
+              suh_txt = pathlib.Path("drivers/kernelsu/feature/sucompat.h").read_text()
+              pp = suh_txt.split("#else")[0] if "#else" in suh_txt else suh_txt
+
+          h_fac_user = bool(re.search(r"ksu_handle_faccessat\s*\([^)]*const\s+char\s+(?:__user\s+)?\*\*", pp))
+          h_stat_user = bool(re.search(r"ksu_handle_stat\s*\([^)]*const\s+char\s+(?:__user\s+)?\*\*", pp))
+          h_fac_fn = bool(re.search(r"ksu_handle_faccessat\s*\([^)]*struct\s+filename\s*\*\*", pp))
+          h_stat_fn = bool(re.search(r"ksu_handle_stat\s*\([^)]*struct\s+filename\s*\*\*", pp))
+
+          print(f"[ABI Gate] fs/open.c user={open_uses_user}, fn={open_uses_fn} | sucompat.h user={h_fac_user}, fn={h_fac_fn}")
+          print(f"[ABI Gate] fs/stat.c user={stat_uses_user}, fn={stat_uses_fn} | sucompat.h user={h_stat_user}, fn={h_stat_fn}")
+
+          if open_uses_user and not h_fac_user:
+              raise SystemExit("ABI MISMATCH on ksu_handle_faccessat (open.c uses user_ptr)!")
+          if open_uses_fn and not h_fac_fn:
+              raise SystemExit("ABI MISMATCH on ksu_handle_faccessat (open.c uses filename_ptr)!")
+          if stat_uses_user and not h_stat_user:
+              raise SystemExit("ABI MISMATCH on ksu_handle_stat (stat.c uses user_ptr)!")
+          if stat_uses_fn and not h_stat_fn:
+              raise SystemExit("ABI MISMATCH on ksu_handle_stat (stat.c uses filename_ptr)!")
+          print("[+] ABI Gate PASSED!")
+          PYEOF
+
+          if grep -rq "ksu_handle_sys_reboot" drivers/kernelsu/ 2>/dev/null; then
+            if ! grep -q "ksu_handle_sys_reboot" kernel/reboot.c 2>/dev/null; then
+              echo "::error::Missing ksu_handle_sys_reboot in kernel/reboot.c!"
+              exit 1
+            fi
+            echo "[+] Verified: kernel/reboot.c calls ksu_handle_sys_reboot."
+          fi
+
+      - name: Inject SukiSU-Ultra + KPM + SUSFS flags into pipa defconfig
+        working-directory: kernel
+        run: |
+          DEFCONFIG="${{ inputs.defconfig }}"
+          if [ -z "$DEFCONFIG" ]; then
+            DEFCONFIG="vendor/pipa_defconfig"
+          fi
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+
+          CFG_FILE="arch/arm64/configs/$DEFCONFIG"
+          cat << 'EOF' >> "$CFG_FILE"
+
+          # SukiSU-Ultra (4.19 non-GKI builtin + KPM)
+          CONFIG_KSU=y
+          CONFIG_KPM=y
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_OVERLAY_FS=y
+          # CONFIG_TRIM_UNUSED_KSYMS is not set
+          EOF
+
+          if grep -q "config KSU_MANUAL_HOOK" drivers/kernelsu/Kconfig 2>/dev/null; then
+            echo "CONFIG_KSU_MANUAL_HOOK=y" >> "$CFG_FILE"
+          fi
+          if grep -q "config KSU_KPROBES_HOOK" drivers/kernelsu/Kconfig 2>/dev/null; then
+            echo "# CONFIG_KSU_KPROBES_HOOK is not set" >> "$CFG_FILE"
+          fi
+
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            cat << 'EOF' >> "$CFG_FILE"
+
+          # SUSFS v2.4.0 options
+          CONFIG_KSU_SUSFS=y
+          CONFIG_KSU_SUSFS_SUS_PATH=y
+          CONFIG_KSU_SUSFS_SUS_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_KSU_DEFAULT_MOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_SUS_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SUS_KSTAT=y
+          CONFIG_KSU_SUSFS_TRY_UMOUNT=y
+          CONFIG_KSU_SUSFS_AUTO_ADD_TRY_UMOUNT_FOR_BIND_MOUNT=y
+          CONFIG_KSU_SUSFS_SPOOF_UNAME=y
+          CONFIG_KSU_SUSFS_ENABLE_LOG=y
+          CONFIG_KSU_SUSFS_HIDE_KSU_SUSFS_SYMBOLS=y
+          CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG=y
+          CONFIG_KSU_SUSFS_OPEN_REDIRECT=y
+          CONFIG_KSU_SUSFS_PRIORITY_UID_FILTER=y
+          CONFIG_KSU_SUSFS_SUS_MAP=y
+          EOF
+          fi
+
+      - name: Compile E404 kernel (Image.gz only)
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            HOSTCC=clang
+            HOSTCXX=clang++
+            LD=ld.lld
+            HOSTLD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            STRIP=llvm-strip
+            LLVM=1
+            LLVM_IAS=1
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          )
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          echo "[+] Auditing active KSU, SUSFS, KPM & LTO flags in out/.config:"
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|LTO|TRIM_UNUSED_KSYMS)" out/.config | tee ../config-audit.txt
+
+          grep -q "^CONFIG_KSU=y$" out/.config
+          grep -q "^CONFIG_KPM=y$" out/.config
+          grep -q "^CONFIG_KALLSYMS_ALL=y$" out/.config
+          if [ "${{ inputs.enable_susfs }}" = "true" ]; then
+            grep -q "^CONFIG_KSU_SUSFS=y$" out/.config
+            grep -q "^CONFIG_KSU_SUSFS_SUS_MAP=y$" out/.config
+          fi
+
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image.gz 2>&1 | tee ../build.log
+          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz
+          file out/arch/arm64/boot/Image.gz
+
+      - name: Extract compiler and linker errors (on failure)
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            grep -nE "error:|fatal error:|undefined symbol:|duplicate symbol:|ld\.lld:" build.log | head -n 120 > compile-errors.txt || true
+            tail -n 150 build.log > build-tail.txt || true
+          fi
+
+      - name: Upload compile error logs (on failure)
+        if: failure() && env.HAS_REJECTS != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-error-logs
+          path: |
+            compile-errors.txt
+            build-tail.txt
+
+      - name: Package Image.gz-only AnyKernel3 zip (no dtb, no dtbo)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/README.md AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
+
+          cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
+
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=E404-SukiSU-Ultra-KPM-SUSFS-pipa
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=pipa
+          device.name2=pipa_pad_cn
+          device.name3=23043RP34G
+          device.name4=pipa_global
+          device.name5=pipa_in
+          supported.versions=13-16
+          supported.patchlevels=
+          '; }
+
+          BLOCK=auto;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          test -s AnyKernel3/Image.gz
+          test ! -e AnyKernel3/Image
+          test ! -e AnyKernel3/dtb
+          test ! -e AnyKernel3/dtbo.img
+
+          cd AnyKernel3
+          ZIP_NAME="E404-SukiSU-Ultra-KPM-SUSFS-pipa-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP_NAME" ./*
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload AnyKernel3 artifact and audits
+        uses: actions/upload-artifact@v4
+        with:
+          name: E404-SukiSU-Ultra-KPM-SUSFS-pipa-AnyKernel3
+          path: |
+            ${{ env.ZIP_NAME }}
+            config-audit.txt
+            hook-audit.txtkernel_repo:
