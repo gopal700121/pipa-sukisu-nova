@@ -1,0 +1,223 @@
+name: Build N0Kernel r1 Clean Root-Free AnyKernel3 (pipa)
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_zip_url:
+        description: 'Direct N0Kernel r1 source zip URL'
+        required: true
+        default: 'https://github.com/CuriousNom/n0_kernel_pipa/archive/refs/tags/r1.zip'
+      clang_rev:
+        description: 'Google AOSP Clang revision (native MLGO support)'
+        type: choice
+        default: 'clang-r522817'
+        options:
+          - clang-r522817
+          - clang-r547379
+      defconfig:
+        description: 'Defconfig path (leave empty to auto-detect pipa defconfig)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential bc bison flex libssl-dev \
+            libelf-dev cpio zip unzip curl wget git python-is-python3 patch file \
+            gcc-aarch64-linux-gnu gcc-arm-linux-gnueabi
+
+      - name: Download & verify Google AOSP Clang (MLGO)
+        shell: bash
+        run: |
+          set -euo pipefail
+          DOWNLOADED=0
+          for REV in "${{ inputs.clang_rev }}" "clang-r547379" "clang-r522817"; do
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${REV}.tar.gz"
+            echo "[+] Trying AOSP Clang: $REV"
+            if curl -fL --retry 3 "$URL" -o clang.tar.gz; then
+              rm -rf "$HOME/clang" && mkdir -p "$HOME/clang"
+              tar -xzf clang.tar.gz -C "$HOME/clang"
+              rm -f clang.tar.gz
+              if "$HOME/clang/bin/clang" -mllvm -regalloc-enable-advisor=release -x c -c /dev/null -o /dev/null; then
+                echo "[+] Verified $REV with native MLGO support:"
+                "$HOME/clang/bin/clang" --version
+                DOWNLOADED=1
+                break
+              fi
+            fi
+          done
+          if [ "$DOWNLOADED" -ne 1 ]; then
+            echo "::error::Failed to download a working AOSP Clang with MLGO support."
+            exit 1
+          fi
+
+      - name: Download and extract N0Kernel source (r1.zip)
+        shell: bash
+        run: |
+          curl -fL --retry 3 "${{ inputs.kernel_zip_url }}" -o kernel_src.zip
+          mkdir -p tmp_src kernel
+          unzip -q kernel_src.zip -d tmp_src
+          shopt -s dotglob
+          mv tmp_src/*/* kernel/
+          rm -rf tmp_src kernel_src.zip
+          ls -la kernel/Makefile
+
+      - name: Strip all root solutions (KSU/RKSU/SukiSU/SUSFS) and configure clean APatch-ready defconfig
+        working-directory: kernel
+        run: |
+          echo "[+] Checking for any root directories in N0Kernel r1:"
+          ls -ld KernelSU RKSU drivers/kernelsu fs/susfs.c 2>/dev/null || true
+
+          rm -rf KernelSU RKSU drivers/kernelsu
+          sed -i '/kernelsu/d' drivers/Makefile drivers/Kconfig || true
+
+          # Allow CONFIG_KALLSYMS_ALL=y without enabling DEBUG_KERNEL / SCHED_DEBUG
+          sed -i 's/depends on DEBUG_KERNEL && KALLSYMS/depends on KALLSYMS/' init/Kconfig
+
+          DEFCONFIG="${{ inputs.defconfig }}"
+          if [ -z "$DEFCONFIG" ]; then
+            if [ -f "arch/arm64/configs/vendor/pipa_defconfig" ]; then
+              DEFCONFIG="vendor/pipa_defconfig"
+            elif [ -f "arch/arm64/configs/pipa_defconfig" ]; then
+              DEFCONFIG="pipa_defconfig"
+            else
+              echo "Could not auto-detect pipa defconfig. Available matches:"
+              find arch/arm64/configs -iname "*pipa*"
+              exit 1
+            fi
+          fi
+          echo "DEFCONFIG=$DEFCONFIG" >> "$GITHUB_ENV"
+
+          CFG_FILE="arch/arm64/configs/$DEFCONFIG"
+          sed -i '/CONFIG_KSU/d; /CONFIG_KPM/d; /CONFIG_KALLSYMS/d' "$CFG_FILE"
+
+          cat << 'EOF' >> "$CFG_FILE"
+
+          # Clean root-free stock N0Kernel (zero KSU/RKSU/SukiSU/SUSFS)
+          # CONFIG_KSU is not set
+
+          # Clean symbol table (APatch-ready if patched later in APatch Manager)
+          CONFIG_KALLSYMS=y
+          CONFIG_KALLSYMS_ALL=y
+          CONFIG_OVERLAY_FS=y
+          # CONFIG_TRIM_UNUSED_KSYMS is not set
+          EOF
+
+      - name: Compile clean root-free N0Kernel r1 (Image.gz only)
+        working-directory: kernel
+        run: |
+          set -o pipefail
+          export PATH="$HOME/clang/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          MAKE_ARGS=(
+            O=out
+            ARCH=arm64
+            CC=clang
+            HOSTCC=clang
+            HOSTCXX=clang++
+            LD=ld.lld
+            HOSTLD=ld.lld
+            AR=llvm-ar
+            NM=llvm-nm
+            OBJCOPY=llvm-objcopy
+            OBJDUMP=llvm-objdump
+            READELF=llvm-readelf
+            STRIP=llvm-strip
+            LLVM=1
+            LLVM_IAS=1
+            CLANG_TRIPLE=aarch64-linux-gnu-
+            CROSS_COMPILE=aarch64-linux-gnu-
+            CROSS_COMPILE_ARM32=arm-linux-gnueabi-
+          )
+          make "${MAKE_ARGS[@]}" "$DEFCONFIG"
+
+          echo "[+] Auditing active KSU, KPM, KALLSYMS, OVERLAY_FS & LTO flags in out/.config:"
+          grep -E "^CONFIG_(KSU|KPM|KALLSYMS|OVERLAY_FS|LTO|TRIM_UNUSED_KSYMS)" out/.config | tee ../config-audit.txt
+
+          # Hard-assert 100% root-free and APatch-ready
+          grep -q "^CONFIG_KALLSYMS=y$" out/.config
+          grep -q "^CONFIG_KALLSYMS_ALL=y$" out/.config
+          if grep -qE "^CONFIG_(KSU|KPM)" out/.config; then
+            echo "::error::Found active KSU/KPM config in root-free build! Aborting."
+            exit 1
+          fi
+
+          make -j"$(nproc)" "${MAKE_ARGS[@]}" Image.gz 2>&1 | tee ../build.log
+          ls -lh out/arch/arm64/boot/Image out/arch/arm64/boot/Image.gz
+          file out/arch/arm64/boot/Image.gz
+
+      - name: Extract compiler and linker errors (on failure)
+        if: failure()
+        run: |
+          if [ -f build.log ]; then
+            grep -nE "error:|fatal error:|undefined symbol:|duplicate symbol:|ld\.lld:" build.log | head -n 120 > compile-errors.txt || true
+            tail -n 150 build.log > build-tail.txt || true
+          fi
+
+      - name: Upload compile error logs (on failure)
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: compile-error-logs
+          path: |
+            compile-errors.txt
+            build-tail.txt
+
+      - name: Package Image.gz-only AnyKernel3 zip (no dtb, no dtbo)
+        run: |
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3
+          rm -rf AnyKernel3/.git AnyKernel3/README.md AnyKernel3/modules AnyKernel3/patch AnyKernel3/ramdisk
+
+          cp kernel/out/arch/arm64/boot/Image.gz AnyKernel3/Image.gz
+
+          cat << 'EOF' > AnyKernel3/anykernel.sh
+          ### AnyKernel3 Ramdisk Mod Script
+          properties() { '
+          kernel.string=N0Kernel-r1-Clean-Stock-pipa
+          do.devicecheck=1
+          do.modules=0
+          do.systemless=1
+          do.cleanup=1
+          do.cleanuponabort=0
+          device.name1=pipa
+          device.name2=pipa_pad_cn
+          device.name3=23043RP34G
+          device.name4=pipa_global
+          device.name5=pipa_in
+          supported.versions=13-16
+          supported.patchlevels=
+          '; }
+
+          BLOCK=auto;
+          IS_SLOT_DEVICE=1;
+          RAMDISK_COMPRESSION=auto;
+          PATCH_VBMETA_FLAG=auto;
+
+          . tools/ak3-core.sh;
+
+          split_boot;
+          flash_boot;
+          EOF
+
+          test -s AnyKernel3/Image.gz
+          test ! -e AnyKernel3/Image
+          test ! -e AnyKernel3/dtb
+          test ! -e AnyKernel3/dtbo.img
+
+          cd AnyKernel3
+          ZIP_NAME="N0Kernel-r1-Clean-Stock-pipa-AnyKernel3-$(date +%Y%m%d-%H%M).zip"
+          zip -r9 "../$ZIP_NAME" ./*
+          echo "ZIP_NAME=$ZIP_NAME" >> "$GITHUB_ENV"
+
+      - name: Upload AnyKernel3 artifact and config audit
+        uses: actions/upload-artifact@v4
+        with:
+          name: N0Kernel-r1-Clean-Stock-pipa-AnyKernel3
+          path: |
+            ${{ env.ZIP_NAME }}
+            config-audit.txt
