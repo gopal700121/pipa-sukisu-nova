@@ -175,3 +175,40 @@ for opt in required_opts:
         defcfg += f"\n{opt}\n"
 open(defcfg_path, "w").write(defcfg)
 print(">>> Updated vendor/pipa_defconfig with:", required_opts)
+
+# 10. Reconcile SUSFS v2.1.0 <-> KSUN v3.1.0-legacy-susfs API bridge
+susfs_def = open("include/linux/susfs_def.h").read()
+susfs_h = open("include/linux/susfs.h").read()
+print("=== include/linux/susfs_def.h umounted helpers ===")
+for line in susfs_def.splitlines():
+    if "umounted" in line or "TIF_PROC" in line or "susfs_set_current" in line:
+        print("  ", line)
+
+sh_path = "drivers/kernelsu/setuid_hook.c"
+if os.path.exists(sh_path):
+    sh = open(sh_path).read()
+    if "#include <linux/susfs_def.h>" not in sh and "susfs_set_current_proc_umounted" in sh:
+        sh = "#ifdef CONFIG_KSU_SUSFS\n#include <linux/susfs_def.h>\n#endif\n" + sh
+        open(sh_path, "w").write(sh)
+        print(">>> Added #include <linux/susfs_def.h> to drivers/kernelsu/setuid_hook.c")
+
+if "susfs_set_current_proc_umounted(" not in susfs_def and "susfs_set_current_proc_umounted(" not in susfs_h:
+    if "susfs_set_current_proc_umounted_app(" in susfs_def:
+        wrapper = "\nstatic inline void susfs_set_current_proc_umounted(void) { susfs_set_current_proc_umounted_app(); }\n"
+    elif "TIF_PROC_UMOUNTED" in susfs_def:
+        wrapper = "\nstatic inline void susfs_set_current_proc_umounted(void) { set_ti_thread_flag(&current->thread_info, TIF_PROC_UMOUNTED); }\n"
+    else:
+        wrapper = "\nstatic inline void susfs_set_current_proc_umounted(void) {}\n"
+    susfs_def = re.sub(r"(#endif\s*)$", wrapper + r"\1", susfs_def, count=1)
+    open("include/linux/susfs_def.h", "w").write(susfs_def)
+    print(">>> Added compat wrapper to include/linux/susfs_def.h:", wrapper.strip())
+
+# Audit all susfs_* calls in drivers/kernelsu/*.c against susfs headers
+hdr_blob = open("include/linux/susfs_def.h").read() + "\n" + susfs_h
+missing = set()
+for cf in glob.glob("drivers/kernelsu/*.c"):
+    ctxt = open(cf, errors="ignore").read()
+    for sym in re.findall(r"\b(susfs_[a-zA-Z0-9_]+)\s*\(", ctxt):
+        if sym + "(" not in hdr_blob and sym + " (" not in hdr_blob:
+            missing.add((cf, sym))
+print("=== Missing susfs_* declarations in headers ===", sorted(missing))
