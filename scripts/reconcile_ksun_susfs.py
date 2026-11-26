@@ -212,3 +212,23 @@ if "susfs_set_current_proc_umounted(" not in susfs_def and "susfs_set_current_pr
     open(susfs_def_path, "w").write("".join(lines))
     assert "susfs_set_current_proc_umounted(" in open(susfs_def_path).read(), "Wrapper insertion failed"
     print(">>> Injected compat wrapper into include/linux/susfs_def.h:", wrapper.strip())
+# 11. Stub removed SUSFS v2.0.0 helpers expected by KSUN ba4422f supercalls.c
+susfs_h_path = "include/linux/susfs.h"
+susfs_h_txt = open(susfs_h_path).read()
+compat_stubs = []
+if "susfs_set_i_state_on_external_dir(" not in susfs_h_txt:
+    compat_stubs.append("static inline void susfs_set_i_state_on_external_dir(void __user **user_info) { (void)user_info; }")
+if "susfs_add_try_umount(" not in susfs_h_txt:
+    compat_stubs.append("static inline void susfs_add_try_umount(void __user **user_info) { (void)user_info; }")
+if "susfs_try_umount(" not in susfs_h_txt:
+    compat_stubs.append("static inline void susfs_try_umount(uid_t uid) { (void)uid; }")
+if compat_stubs:
+    h_lines = susfs_h_txt.splitlines(keepends=True)
+    h_endifs = [i for i, l in enumerate(h_lines) if l.lstrip().startswith("#endif")]
+    stub_block = "\n/* KSUN v3.1.0-legacy-susfs <-> SUSFS v2.4.0 compat stubs */\n" + "\n".join(compat_stubs) + "\n"
+    if h_endifs:
+        h_lines.insert(h_endifs[-1], stub_block)
+    else:
+        h_lines.append(stub_block)
+    open(susfs_h_path, "w").write("".join(h_lines))
+    print(">>> Injected SUSFS compat stubs into include/linux/susfs.h:", compat_stubs)
