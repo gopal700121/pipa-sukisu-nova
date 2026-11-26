@@ -147,8 +147,23 @@ jobs:
                   open("fs/proc/task_mmu.c", "w").write(txt)
                   os.remove("fs/proc/task_mmu.c.rej")
                   print(">>> Resolved fs/proc/task_mmu.c.rej cleanly")
-
-          rejs = glob.glob("**/*.rej", recursive=True)
+          if os.path.exists("include/linux/sched.h.rej"):
+             rej_txt = open("include/linux/sched.h.rej").read()
+             print(">>> Reconciling include/linux/sched.h.rej:")
+             print(rej_txt)
+             added = [line[1:] for line in rej_txt.splitlines() if line.startswith("+") and not line.startswith("+++")]
+             if added and any("SUSFS" in l or "susfs" in l for l in added):
+                 sched = open("include/linux/sched.h").read()
+                 block = "\n".join(added) + "\n"
+                 anchor = "\trandomized_struct_fields_end"
+                 if anchor not in sched:
+                     anchor = "\t/* CPU-specific state of this task: */"
+                  assert anchor in sched, "No anchor in include/linux/sched.h"                     
+                  sched = sched.replace(anchor, block + anchor, 1)
+                  open("include/linux/sched.h", "w").write(sched)
+                  os.remove("include/linux/sched.h.rej")
+                  print(">>> Resolved include/linux/sched.h.rej cleanly")
+                  rejs = glob.glob("**/*.rej", recursive=True)
           if rejs:
               print("ERROR: Unresolved .rej files:", rejs, file=sys.stderr)
               for r in rejs:
