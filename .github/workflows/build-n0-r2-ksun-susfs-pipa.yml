@@ -3,10 +3,10 @@ name: Build N0Kernel r2 (KSUN v3.1.0 + SUSFS v2.1.0) for Xiaomi Pad 6 (pipa)
 on:
   workflow_dispatch:
     inputs:
-      ksun_tag:
-        description: "KernelSU-Next tag (auto tries v3.1.0 then v3.1.0-legacy; hard cap < v3.2.0)"
+      ksun_ref:
+        description: "KernelSU-Next ref (default: legacy_susfs — v3.1.0-legacy-susfs line)"
         required: false
-        default: "auto"
+        default: "legacy_susfs"
       publish_release:
         description: "Publish GitHub Release r2-ksun-v1"
         required: false
@@ -22,29 +22,6 @@ jobs:
       - name: Checkout workflow repo
         uses: actions/checkout@v4
 
-      - name: Free disk space & install build dependencies
-        run: |
-          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq bc bison build-essential ccache cpio curl flex git \
-            kmod libelf-dev libssl-dev llvm lld python3 python3-pip unzip xz-utils zip zstd
-
-      - name: Download AOSP Clang (clang-r522817, fallback clang-r547379)
-        run: |
-          mkdir -p "$HOME/clang"
-          CLANG_REV="clang-r522817"
-          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_REV}.tar.gz"
-          if ! curl -fsSL "$URL" -o "$HOME/clang.tar.gz"; then
-            CLANG_REV="clang-r547379"
-            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_REV}.tar.gz"
-            curl -fsSL "$URL" -o "$HOME/clang.tar.gz"
-          fi
-          tar -xzf "$HOME/clang.tar.gz" -C "$HOME/clang"
-          rm -f "$HOME/clang.tar.gz"
-          echo "CLANG_REV=${CLANG_REV}" >> "$GITHUB_ENV"
-          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
-          "$HOME/clang/bin/clang" --version | head -n 2
-
       - name: Clone N0Kernel r1 base & strip old KernelSU
         run: |
           git clone --depth=1 --branch r1 https://github.com/CuriousNom/n0_kernel_pipa.git kernel
@@ -55,7 +32,7 @@ jobs:
           rm -rf KernelSU KernelSU-Next drivers/kernelsu
           git status -s
 
-      - name: Integrate KernelSU-Next (v3.1.0-legacy-susfs) & SUSFS v2.1.0 (kernel-4.19)
+      - name: Integrate KernelSU-Next (legacy_susfs) & SUSFS v2.1.0 (kernel-4.19)
         run: |
           set -euo pipefail
           WORK_DIR="$(pwd)"
@@ -66,23 +43,28 @@ jobs:
           echo "SUSFS_COMMIT=${SUSFS_COMMIT}" >> "$GITHUB_ENV"
           echo "SUSFS4KSU kernel-4.19 commit: ${SUSFS_COMMIT}"
 
-          REQ_TAG="${{ github.event.inputs.ksun_tag || 'auto' }}"
-          if [[ "$REQ_TAG" == "auto" ]]; then
-            CHOSEN_TAG="v3.1.0-legacy-susfs"
+          echo "=== KernelSU-Next susfs refs ==="
+          git ls-remote --heads --tags https://github.com/KernelSU-Next/KernelSU-Next.git '*susfs*' || true
+
+          REQ_REF="${{ github.event.inputs.ksun_ref || 'legacy_susfs' }}"
+          rm -rf KernelSU-Next drivers/kernelsu
+          if git clone --depth=1 --branch "${REQ_REF}" https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next; then
+            CHOSEN_TAG="${REQ_REF}"
           else
-            if [[ "$REQ_TAG" != v3.1.0* ]]; then
-              echo "ERROR: Tag '$REQ_TAG' violates hard cap (< v3.2.0)" >&2
-              exit 1
-            fi
-            CHOSEN_TAG="$REQ_TAG"
+            echo ">>> Branch ${REQ_REF} unavailable; fetching pinned v3.1.0-legacy-susfs commit ba4422f"
+            mkdir -p KernelSU-Next
+            git -C KernelSU-Next init
+            git -C KernelSU-Next remote add origin https://github.com/KernelSU-Next/KernelSU-Next.git
+            git -C KernelSU-Next fetch --depth=1 origin ba4422f
+            git -C KernelSU-Next checkout FETCH_HEAD
+            CHOSEN_TAG="v3.1.0-legacy-susfs@ba4422f"
           fi
 
-          rm -rf KernelSU-Next drivers/kernelsu
-          git clone --depth=1 --branch "${CHOSEN_TAG}" https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
           KSUN_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
           echo "CHOSEN_KSUN_TAG=${CHOSEN_TAG}" >> "$GITHUB_ENV"
           echo "KSUN_COMMIT=${KSUN_COMMIT}" >> "$GITHUB_ENV"
-          echo "Selected KernelSU-Next tag: ${CHOSEN_TAG} (${KSUN_COMMIT})"
+          echo "Selected KernelSU-Next ref: ${CHOSEN_TAG} (${KSUN_COMMIT})"
+          git -C KernelSU-Next log -1 --oneline || true
 
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
           if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
@@ -92,8 +74,6 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          # Note: v3.1.0-legacy-susfs already contains native KernelSU-Next SUSFS integration;
-          # do NOT apply simonpunk's 10_enable_susfs_for_ksu.patch (which targets tiann/KernelSU).
           cp -r "$WORK_DIR/susfs4ksu/kernel_patches/fs/"* fs/
           cp -r "$WORK_DIR/susfs4ksu/kernel_patches/include/linux/"* include/linux/
           echo ">>> Applying 50_add_susfs_in_kernel-4.19.patch"
@@ -247,6 +227,29 @@ jobs:
         run: |
           chmod +x scripts/ksu_abi_gate.sh
           ./scripts/ksu_abi_gate.sh kernel | tee abi-gate.txt
+
+      - name: Free disk space & install build dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison build-essential ccache cpio curl flex git \
+            kmod libelf-dev libssl-dev llvm lld python3 python3-pip unzip xz-utils zip zstd
+
+      - name: Download AOSP Clang (clang-r522817, fallback clang-r547379)
+        run: |
+          mkdir -p "$HOME/clang"
+          CLANG_REV="clang-r522817"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_REV}.tar.gz"
+          if ! curl -fsSL "$URL" -o "$HOME/clang.tar.gz"; then
+            CLANG_REV="clang-r547379"
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_REV}.tar.gz"
+            curl -fsSL "$URL" -o "$HOME/clang.tar.gz"
+          fi
+          tar -xzf "$HOME/clang.tar.gz" -C "$HOME/clang"
+          rm -f "$HOME/clang.tar.gz"
+          echo "CLANG_REV=${CLANG_REV}" >> "$GITHUB_ENV"
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          "$HOME/clang/bin/clang" --version | head -n 2
 
       - name: Build A (r2-A — ThinLTO ON, daily driver)
         run: |
