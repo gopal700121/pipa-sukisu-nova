@@ -32,64 +32,39 @@ jobs:
           rm -rf KernelSU KernelSU-Next drivers/kernelsu
           git status -s
 
-      - name: Integrate KernelSU-Next (v3.1.0-legacy-susfs) & SUSFS v2.1.0 (kernel-4.19)
+      - name: Integrate KernelSU-Next (v3.1.0-legacy-susfs) & SUSFS v2.x 4.19 backport
         run: |
           set -euo pipefail
           WORK_DIR="$(pwd)"
           cd kernel
 
-          git clone --depth=1 --branch kernel-4.19 https://gitlab.com/simonpunk/susfs4ksu.git "$WORK_DIR/susfs4ksu"
-          SUSFS_COMMIT="$(git -C "$WORK_DIR/susfs4ksu" rev-parse HEAD)"
+          # Clone JackA1ltman/NonGKI_Kernel_Build_2nd for 4.19 SUSFS v2.x backport (simonpunk kernel-4.19 is v1.5.x only)
+          git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git "$WORK_DIR/nongki"
+          SUSFS_COMMIT="$(git -C "$WORK_DIR/nongki" rev-parse HEAD)"
           echo "SUSFS_COMMIT=${SUSFS_COMMIT}" >> "$GITHUB_ENV"
-          echo "SUSFS4KSU kernel-4.19 commit: ${SUSFS_COMMIT}"
+          echo "NonGKI_Kernel_Build_2nd commit: ${SUSFS_COMMIT}"
+          ls -la "$WORK_DIR/nongki/Patches" "$WORK_DIR/nongki/Patches/Patch" || true
 
-           # Read exact KSUN submodule URL and pinned v3.1.0-legacy-susfs commit from fnxln/kernel_xiaomi_ginkgo_ksu (ginkgo-susfs)
+          # Fetch exact pinned KernelSU-Next v3.1.0-legacy-susfs commit from fnxln/kernel_xiaomi_ginkgo_ksu
           git clone --depth=1 --branch ginkgo-susfs --filter=blob:none --no-checkout https://github.com/fnxln/kernel_xiaomi_ginkgo_ksu.git "$WORK_DIR/fnxln_ref"
           git -C "$WORK_DIR/fnxln_ref" checkout HEAD -- .gitmodules
-          cat "$WORK_DIR/fnxln_ref/.gitmodules"
           GM_URL="$(git -C "$WORK_DIR/fnxln_ref" config -f .gitmodules --get submodule.KernelSU-Next.url || true)"
           GM_SHA="$(git -C "$WORK_DIR/fnxln_ref" ls-tree HEAD KernelSU-Next | awk '{print $3}' || true)"
           echo "fnxln submodule URL: ${GM_URL:-<none>}, SHA: ${GM_SHA:-<none>}"
 
           rm -rf KernelSU-Next drivers/kernelsu
-          CHOSEN_TAG=""
-          KSUN_REPO=""
-
-          if [[ -n "$GM_URL" && -n "$GM_SHA" ]]; then
-            mkdir -p KernelSU-Next
-            git -C KernelSU-Next init -q
-            git -C KernelSU-Next remote add origin "${GM_URL}"
-            if git -C KernelSU-Next fetch --depth=1 origin "${GM_SHA}"; then
-              git -C KernelSU-Next checkout -q FETCH_HEAD
-              CHOSEN_TAG="v3.1.0-legacy-susfs@${GM_SHA:0:7}"
-              KSUN_REPO="${GM_URL}"
-            else
-              rm -rf KernelSU-Next
-            fi
-          fi
-
-          if [[ -z "$CHOSEN_TAG" && -n "$GM_URL" ]]; then
-            for REF in v3.1.0-legacy-susfs legacy-susfs legacy_susfs; do
-              if git clone --depth=1 --branch "${REF}" "${GM_URL}" KernelSU-Next 2>/dev/null; then
-                CHOSEN_TAG="${REF}"
-                KSUN_REPO="${GM_URL}"
-                break
-              fi
-            done
-          fi
-
-          if [[ -z "$CHOSEN_TAG" ]]; then
-            echo "ERROR: Could not fetch v3.1.0-legacy-susfs from ${GM_URL:-<none>}" >&2
-            exit 1
-          fi
+          mkdir -p KernelSU-Next
+          git -C KernelSU-Next init -q
+          git -C KernelSU-Next remote add origin "${GM_URL}"
+          git -C KernelSU-Next fetch --depth=1 origin "${GM_SHA}"
+          git -C KernelSU-Next checkout -q FETCH_HEAD
 
           KSUN_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
-          echo "CHOSEN_KSUN_TAG=${CHOSEN_TAG}" >> "$GITHUB_ENV"
-          echo "KSUN_REPO=${KSUN_REPO}" >> "$GITHUB_ENV"
+          echo "CHOSEN_KSUN_TAG=v3.1.0-legacy-susfs@${GM_SHA:0:7}" >> "$GITHUB_ENV"
+          echo "KSUN_REPO=${GM_URL}" >> "$GITHUB_ENV"
           echo "KSUN_COMMIT=${KSUN_COMMIT}" >> "$GITHUB_ENV"
-          echo "Selected KernelSU-Next: ${KSUN_REPO} @ ${CHOSEN_TAG} (${KSUN_COMMIT})"
-          git -C KernelSU-Next log -1 --oneline || true       
-
+          echo "Selected KernelSU-Next: ${GM_URL} @ ${KSUN_COMMIT}"
+          git -C KernelSU-Next log -1 --oneline || true
 
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
           if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
@@ -99,14 +74,31 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          cp -r "$WORK_DIR/susfs4ksu/kernel_patches/fs/"* fs/
-          cp -r "$WORK_DIR/susfs4ksu/kernel_patches/include/linux/"* include/linux/
-          echo ">>> Applying 50_add_susfs_in_kernel-4.19.patch"
-          set +e
-          patch -p1 --fuzz=3 --forward < "$WORK_DIR/susfs4ksu/kernel_patches/50_add_susfs_in_kernel-4.19.patch"
-          PATCH_RC=$?
-          set -e
-          echo "50_add_susfs_in_kernel-4.19.patch exit code: ${PATCH_RC}"
+          # Locate and apply 4.19 SUSFS v2.x patch & source files from NonGKI_Kernel_Build_2nd
+          SUS_PATCH="$(find "$WORK_DIR/nongki" -type f -name '*4.19*.patch' | head -n 1 || true)"
+          echo "Found 4.19 SUSFS patch: ${SUS_PATCH:-<none>}"
+          # Copy susfs.c / susfs.h / susfs_def.h if shipped outside the patch
+          for F in susfs.c; do
+            SRC="$(find "$WORK_DIR/nongki" -type f -name "$F" | head -n 1 || true)"
+            [[ -n "$SRC" ]] && cp "$SRC" fs/
+          done
+          for F in susfs.h susfs_def.h; do
+            SRC="$(find "$WORK_DIR/nongki" -type f -name "$F" | head -n 1 || true)"
+            [[ -n "$SRC" ]] && cp "$SRC" include/linux/
+          done
+          if [[ -n "$SUS_PATCH" ]]; then
+            echo ">>> Applying ${SUS_PATCH}"
+            set +e
+            patch -p1 --fuzz=3 --forward < "$SUS_PATCH"
+            PATCH_RC=$?
+            set -e
+            echo "SUSFS 4.19 patch exit code: ${PATCH_RC}"
+          else
+            echo "ERROR: No 4.19 SUSFS patch found in NonGKI_Kernel_Build_2nd" >&2
+            find "$WORK_DIR/nongki" -maxdepth 4 -print
+            exit 1
+          fi
+          grep -E 'SUSFS_VERSION|SUSFS_MAGIC' include/linux/susfs*.h || true
           find . -maxdepth 5 -name '*.rej' -print
 
       - name: Reconcile known 4.19 SUSFS rejects & wire/verify KSUN manual hooks
