@@ -32,7 +32,7 @@ jobs:
           rm -rf KernelSU KernelSU-Next drivers/kernelsu
           git status -s
 
-      - name: Integrate KernelSU-Next (legacy_susfs) & SUSFS v2.1.0 (kernel-4.19)
+      - name: Integrate KernelSU-Next (v3.1.0-legacy-susfs) & SUSFS v2.1.0 (kernel-4.19)
         run: |
           set -euo pipefail
           WORK_DIR="$(pwd)"
@@ -43,28 +43,53 @@ jobs:
           echo "SUSFS_COMMIT=${SUSFS_COMMIT}" >> "$GITHUB_ENV"
           echo "SUSFS4KSU kernel-4.19 commit: ${SUSFS_COMMIT}"
 
-          echo "=== KernelSU-Next susfs refs ==="
-          git ls-remote --heads --tags https://github.com/KernelSU-Next/KernelSU-Next.git '*susfs*' || true
+           # Read exact KSUN submodule URL and pinned v3.1.0-legacy-susfs commit from fnxln/kernel_xiaomi_ginkgo_ksu (ginkgo-susfs)
+          git clone --depth=1 --branch ginkgo-susfs --filter=blob:none --no-checkout https://github.com/fnxln/kernel_xiaomi_ginkgo_ksu.git "$WORK_DIR/fnxln_ref"
+          git -C "$WORK_DIR/fnxln_ref" checkout HEAD -- .gitmodules
+          cat "$WORK_DIR/fnxln_ref/.gitmodules"
+          GM_URL="$(git -C "$WORK_DIR/fnxln_ref" config -f .gitmodules --get submodule.KernelSU-Next.url || true)"
+          GM_SHA="$(git -C "$WORK_DIR/fnxln_ref" ls-tree HEAD KernelSU-Next | awk '{print $3}' || true)"
+          echo "fnxln submodule URL: ${GM_URL:-<none>}, SHA: ${GM_SHA:-<none>}"
 
-          REQ_REF="${{ github.event.inputs.ksun_ref || 'legacy_susfs' }}"
           rm -rf KernelSU-Next drivers/kernelsu
-          if git clone --depth=1 --branch "${REQ_REF}" https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next; then
-            CHOSEN_TAG="${REQ_REF}"
-          else
-            echo ">>> Branch ${REQ_REF} unavailable; fetching pinned v3.1.0-legacy-susfs commit ba4422f"
+          CHOSEN_TAG=""
+          KSUN_REPO=""
+
+          if [[ -n "$GM_URL" && -n "$GM_SHA" ]]; then
             mkdir -p KernelSU-Next
-            git -C KernelSU-Next init
-            git -C KernelSU-Next remote add origin https://github.com/KernelSU-Next/KernelSU-Next.git
-            git -C KernelSU-Next fetch --depth=1 origin ba4422f
-            git -C KernelSU-Next checkout FETCH_HEAD
-            CHOSEN_TAG="v3.1.0-legacy-susfs@ba4422f"
+            git -C KernelSU-Next init -q
+            git -C KernelSU-Next remote add origin "${GM_URL}"
+            if git -C KernelSU-Next fetch --depth=1 origin "${GM_SHA}"; then
+              git -C KernelSU-Next checkout -q FETCH_HEAD
+              CHOSEN_TAG="v3.1.0-legacy-susfs@${GM_SHA:0:7}"
+              KSUN_REPO="${GM_URL}"
+            else
+              rm -rf KernelSU-Next
+            fi
+          fi
+
+          if [[ -z "$CHOSEN_TAG" && -n "$GM_URL" ]]; then
+            for REF in v3.1.0-legacy-susfs legacy-susfs legacy_susfs; do
+              if git clone --depth=1 --branch "${REF}" "${GM_URL}" KernelSU-Next 2>/dev/null; then
+                CHOSEN_TAG="${REF}"
+                KSUN_REPO="${GM_URL}"
+                break
+              fi
+            done
+          fi
+
+          if [[ -z "$CHOSEN_TAG" ]]; then
+            echo "ERROR: Could not fetch v3.1.0-legacy-susfs from ${GM_URL:-<none>}" >&2
+            exit 1
           fi
 
           KSUN_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
           echo "CHOSEN_KSUN_TAG=${CHOSEN_TAG}" >> "$GITHUB_ENV"
+          echo "KSUN_REPO=${KSUN_REPO}" >> "$GITHUB_ENV"
           echo "KSUN_COMMIT=${KSUN_COMMIT}" >> "$GITHUB_ENV"
-          echo "Selected KernelSU-Next ref: ${CHOSEN_TAG} (${KSUN_COMMIT})"
-          git -C KernelSU-Next log -1 --oneline || true
+          echo "Selected KernelSU-Next: ${KSUN_REPO} @ ${CHOSEN_TAG} (${KSUN_COMMIT})"
+          git -C KernelSU-Next log -1 --oneline || true       
+
 
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
           if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
