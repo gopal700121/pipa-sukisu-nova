@@ -55,7 +55,7 @@ jobs:
           rm -rf KernelSU KernelSU-Next drivers/kernelsu
           git status -s
 
-      - name: Integrate KernelSU-Next (<= v3.1.0*) & SUSFS v2.1.0 (kernel-4.19)
+      - name: Integrate KernelSU-Next (v3.1.0-legacy-susfs) & SUSFS v2.1.0 (kernel-4.19)
         run: |
           set -euo pipefail
           WORK_DIR="$(pwd)"
@@ -65,56 +65,20 @@ jobs:
           SUSFS_COMMIT="$(git -C "$WORK_DIR/susfs4ksu" rev-parse HEAD)"
           echo "SUSFS_COMMIT=${SUSFS_COMMIT}" >> "$GITHUB_ENV"
           echo "SUSFS4KSU kernel-4.19 commit: ${SUSFS_COMMIT}"
-          ls -la "$WORK_DIR/susfs4ksu/kernel_patches" "$WORK_DIR/susfs4ksu/kernel_patches/KernelSU" || true
-
-          echo "=== KernelSU-Next v3.1.0* tags ==="
-          git ls-remote --tags https://github.com/KernelSU-Next/KernelSU-Next.git 'refs/tags/v3.1.0*'
 
           REQ_TAG="${{ github.event.inputs.ksun_tag || 'auto' }}"
-          if [[ "$REQ_TAG" != "auto" && "$REQ_TAG" != v3.1.0* ]]; then
-            echo "ERROR: Tag '$REQ_TAG' violates hard cap (< v3.2.0)" >&2
-            exit 1
-          fi
-
-          try_ksun_tag() {
-            local TAG="$1"
-            echo ">>> Attempting KernelSU-Next tag: ${TAG}"
-            rm -rf KernelSU-Next drivers/kernelsu
-            if ! git clone --depth=1 --branch "${TAG}" https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next; then
-              return 1
-            fi
-            local SUS_KSU_PATCH="$WORK_DIR/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-            if [[ -f "$SUS_KSU_PATCH" ]]; then
-              if (cd KernelSU-Next && patch -p1 --dry-run --fuzz=3 < "$SUS_KSU_PATCH" >/dev/null 2>&1); then
-                echo ">>> SUSFS patch applies cleanly to KernelSU-Next ${TAG}"
-                return 0
-              else
-                echo ">>> SUSFS patch dry-run failed on KernelSU-Next ${TAG}"
-                return 1
-              fi
-            fi
-            return 0
-          }
-
-          CHOSEN_TAG=""
-          if [[ "$REQ_TAG" != "auto" ]]; then
-            try_ksun_tag "$REQ_TAG" || true
-            CHOSEN_TAG="$REQ_TAG"
+          if [[ "$REQ_TAG" == "auto" ]]; then
+            CHOSEN_TAG="v3.1.0-legacy-susfs"
           else
-            for CANDIDATE in v3.1.0 v3.1.0-legacy v3.1.0-legacy-susfs; do
-              if try_ksun_tag "$CANDIDATE"; then
-                CHOSEN_TAG="$CANDIDATE"
-                break
-              fi
-            done
-            if [[ -z "$CHOSEN_TAG" ]]; then
-              echo ">>> Falling back to v3.1.0-legacy"
-              rm -rf KernelSU-Next drivers/kernelsu
-              git clone --depth=1 --branch v3.1.0-legacy https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
-              CHOSEN_TAG="v3.1.0-legacy"
+            if [[ "$REQ_TAG" != v3.1.0* ]]; then
+              echo "ERROR: Tag '$REQ_TAG' violates hard cap (< v3.2.0)" >&2
+              exit 1
             fi
+            CHOSEN_TAG="$REQ_TAG"
           fi
 
+          rm -rf KernelSU-Next drivers/kernelsu
+          git clone --depth=1 --branch "${CHOSEN_TAG}" https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
           KSUN_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
           echo "CHOSEN_KSUN_TAG=${CHOSEN_TAG}" >> "$GITHUB_ENV"
           echo "KSUN_COMMIT=${KSUN_COMMIT}" >> "$GITHUB_ENV"
@@ -128,12 +92,8 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          SUS_KSU_PATCH="$WORK_DIR/susfs4ksu/kernel_patches/KernelSU/10_enable_susfs_for_ksu.patch"
-          if [[ -f "$SUS_KSU_PATCH" ]]; then
-            echo ">>> Applying 10_enable_susfs_for_ksu.patch to KernelSU-Next"
-            (cd KernelSU-Next && patch -p1 --fuzz=3 --forward < "$SUS_KSU_PATCH")
-          fi
-
+          # Note: v3.1.0-legacy-susfs already contains native KernelSU-Next SUSFS integration;
+          # do NOT apply simonpunk's 10_enable_susfs_for_ksu.patch (which targets tiann/KernelSU).
           cp -r "$WORK_DIR/susfs4ksu/kernel_patches/fs/"* fs/
           cp -r "$WORK_DIR/susfs4ksu/kernel_patches/include/linux/"* include/linux/
           echo ">>> Applying 50_add_susfs_in_kernel-4.19.patch"
