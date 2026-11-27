@@ -11,7 +11,11 @@ on:
         description: "Publish GitHub Release r2-ksun-kpm-v1"
         required: false
         default: "true"
-
+      repack_only:
+        description: "Fast repack existing r2-ksun-kpm-v1 Image.gz with updated anykernel.sh"
+        required: false
+        default: "false"
+        
 permissions:
   contents: write
 
@@ -22,7 +26,8 @@ jobs:
       - name: Checkout workflow repo
         uses: actions/checkout@v4
 
-      - name: Clone N0Kernel r1 base & strip old KernelSU
+      - if: ${{ github.event.inputs.repack_only != 'true' }}
+        name: Clone N0Kernel r1 base & strip old KernelSU
         run: |
           git clone --depth=1 --branch r1 https://github.com/CuriousNom/n0_kernel_pipa.git kernel
           cd kernel
@@ -33,6 +38,7 @@ jobs:
           git status -s
 
       - name: Integrate official KernelSU-Next v3.1.0-legacy (NO SUSFS)
+        if: ${{ github.event.inputs.repack_only != 'true' }}
         run: |
           set -euo pipefail
           cd kernel
@@ -52,6 +58,7 @@ jobs:
           fi
 
       - name: Wire KSUN manual hooks & KPM-ready defconfig (Zero SUSFS)
+        if: ${{ github.event.inputs.repack_only != 'true' }}
         run: |
           set -euo pipefail
           cd kernel
@@ -125,6 +132,7 @@ jobs:
           PYEOF
 
       - name: Static validation gate (Zero SUSFS + KSUN 4.19 ABI match)
+        if: ${{ github.event.inputs.repack_only != 'true' }}
         run: |
           set -euo pipefail
           cd kernel
@@ -143,6 +151,7 @@ jobs:
           echo "GATE RESULT: PASSED" | tee ../abi-gate.txt
 
       - name: Free disk space & install build dependencies
+        if: ${{ github.event.inputs.repack_only != 'true' }}
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
           sudo apt-get update -qq
@@ -150,6 +159,7 @@ jobs:
             kmod libelf-dev libssl-dev llvm lld python3 python3-pip unzip xz-utils zip zstd
 
       - name: Download AOSP Clang (clang-r522817, fallback clang-r547379)
+        if: ${{ github.event.inputs.repack_only != 'true' }}
         run: |
           mkdir -p "$HOME/clang"
           CLANG_REV="clang-r522817"
@@ -166,6 +176,7 @@ jobs:
           "$HOME/clang/bin/clang" --version | head -n 2
 
       - name: Build N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready ThinLTO OFF, Zero SUSFS)
+        if: ${{ github.event.inputs.repack_only != 'true' }}
         run: |
           set -euo pipefail
           cd kernel
@@ -200,6 +211,7 @@ jobs:
           ls -lh out/arch/arm64/boot/Image.gz
 
       - name: Post-build error & KSU warning audit
+        if: ${{ github.event.inputs.repack_only != 'true' }}
         run: |
           set -euo pipefail
           if grep -E '(^| )error:' build.log; then
@@ -213,9 +225,17 @@ jobs:
             echo "[PASS] Zero warnings in KernelSU-Next files" | tee -a abi-gate.txt
           fi
 
-      - name: Package Image.gz-only AnyKernel3 zip & SHA-256
-        run: |
+      - env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          name: Package Image.gz-only AnyKernel3 zip & SHA-256
+          run: |
           set -euo pipefail
+          if [ "${{ github.event.inputs.repack_only }}" = "true" ]; then
+            mkdir -p /tmp/repack kernel/out/arch/arm64/boot
+            gh release download r2-ksun-kpm-v1 -p '*.zip' -D /tmp/repack
+            unzip -j /tmp/repack/*.zip Image.gz -d kernel/out/arch/arm64/boot/
+            rm -rf /tmp/repack
+          fi
           git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3_work
           rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
           cat > ak3_work/anykernel.sh << 'AKEOF'
@@ -232,9 +252,13 @@ jobs:
           supported.patchlevels=
           '; }
 
-          block=/dev/block/bootdevice/by-name/boot;
+          BLOCK=boot;
+          block=boot;
+          IS_SLOT_DEVICE=1;
           is_slot_device=1;
+          RAMDISK_COMPRESSION=auto;
           ramdisk_compression=auto;
+          PATCH_VBMETA_FLAG=auto;
           patch_vbmeta_flag=auto;
 
           . tools/ak3-core.sh;
@@ -257,6 +281,7 @@ jobs:
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
+          if-no-files-found: ignore
           name: n0kernel-r2-ksun-kpm-nosusfs-pipa
           path: |
             N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip
@@ -273,13 +298,13 @@ jobs:
           TAG="r2-ksun-kpm-v1"
           ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
           cat > release-notes.md << EOF
-          ## N0Kernel r2 — KernelSU-Next ${KSUN_TAG} + KPM-ready (Zero SUSFS) for Xiaomi Pad 6 (pipa)
+          ## N0Kernel r2 — KernelSU-Next ${KSUN_TAG:-v3.1.0-legacy} + KPM-ready (Zero SUSFS) for Xiaomi Pad 6 (pipa)
 
-          - **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_COMMIT}\`)
-          - **KernelSU-Next:** \`${KSUN_TAG}\` (\`${KSUN_COMMIT}\`)
+          - **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_COMMIT}:-e6708914262c72b3e7eea0433ee5c33b9029e32f\`)
+          - **KernelSU-Next:** \`${KSUN_TAG:-v3.1.0-legacy}\` (\`${KSUN_COMMIT:-1ce19e536de730829b62d0d23dbd96c6ec809e2f}\`)
           - **SUSFS:** Completely removed (zero SUSFS files, headers, patches, or config flags)
           - **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, ThinLTO OFF (\`LOCALVERSION=-r2-ksun-kpm\`)
-          - **Toolchain:** Google AOSP Clang \`${CLANG_REV}\`
+          - **Toolchain:** Google AOSP Clang \`${CLANG_REV:-clang-r522817}\`
           - **Packaging:** \`Image.gz\`-only AnyKernel3 (\`is_slot_device=1\`, \`split_boot; flash_boot;\`)
 
           ### SHA-256 Checksum
