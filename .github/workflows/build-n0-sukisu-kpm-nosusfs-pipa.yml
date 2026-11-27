@@ -1,0 +1,327 @@
+name: Build N0Kernel r1 + SukiSU-Ultra KPM (LTO_NONE, patch_linux, No SUSFS) for pipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      publish_release:
+        description: "Publish GitHub Release n0-sukisu-kpm-nosusfs-v1"
+        required: false
+        default: "true"
+
+permissions:
+  contents: write
+
+jobs:
+  build-sukisu-kpm:
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Checkout workflow repo
+        uses: actions/checkout@v4
+
+      - name: Clone N0Kernel r1 base & strip old KernelSU
+        run: |
+          git clone --depth=1 --branch r1 https://github.com/CuriousNom/n0_kernel_pipa.git kernel
+          cd kernel
+          R1_COMMIT="$(git rev-parse HEAD)"
+          echo "R1_COMMIT=${R1_COMMIT}" >> "$GITHUB_ENV"
+          echo "Base N0Kernel r1 commit: ${R1_COMMIT}"
+          rm -rf KernelSU KernelSU-Next drivers/kernelsu
+
+      - name: Integrate SukiSU-Ultra (builtin, NO SUSFS)
+        run: |
+          set -euo pipefail
+          cd kernel
+          git clone --depth=1 --branch builtin https://github.com/SukiSU-Ultra/SukiSU-Ultra.git KernelSU
+          SUKISU_COMMIT="$(git -C KernelSU rev-parse HEAD)"
+          echo "SUKISU_COMMIT=${SUKISU_COMMIT}" >> "$GITHUB_ENV"
+          echo "SukiSU-Ultra builtin commit: ${SUKISU_COMMIT}"
+
+          ln -s ../KernelSU/kernel drivers/kernelsu
+          if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
+            sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
+          fi
+          if ! grep -q 'kernelsu' drivers/Makefile; then
+            echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
+          fi
+          grep -E "^config (KSU|KPM)" drivers/kernelsu/Kconfig || true
+
+      - name: Apply proven Linux 4.19 SukiSU + KPM compat fixes (Zero SUSFS)
+        run: |
+          set -euo pipefail
+          cd kernel
+          python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+          import os, pathlib, re
+
+          # 1. Guard <linux/static_call.h> for Linux < 5.10
+          ki = pathlib.Path("drivers/kernelsu/kernel_includes.h")
+          if ki.exists():
+              txt = ki.read_text()
+              if "#include <linux/static_call.h>" in txt and "LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)" not in txt:
+                  txt = txt.replace(
+                      "#include <linux/static_call.h>",
+                      "#if LINUX_VERSION_CODE >= KERNEL_VERSION(5, 10, 0)\n#include <linux/static_call.h>\n#endif"
+                  )
+                  ki.write_text(txt)
+                  print("[PASS] Guarded <linux/static_call.h> in kernel_includes.h")
+
+          # 2. 3-arg access_ok() for Linux < 5.0 in kpm.c
+          kpm = pathlib.Path("drivers/kernelsu/extension/kpm/kpm.c")
+          if kpm.exists():
+              txt = kpm.read_text()
+              old_call = "access_ok(u64_to_user_ptr(cmd.result_code), sizeof(result))"
+              if old_call in txt:
+                  txt = txt.replace(old_call, "access_ok(VERIFY_WRITE, u64_to_user_ptr(cmd.result_code), sizeof(result))")
+                  kpm.write_text(txt)
+                  print("[PASS] Patched 3-arg access_ok() in kpm.c")
+
+          # 3. __strncpy_from_user_nofault for Linux < 5.8 in sulog/event.c
+          ev = pathlib.Path("drivers/kernelsu/sulog/event.c")
+          if ev.exists():
+              txt = ev.read_text()
+              txt2 = re.sub(r'(?<![A-Za-z0-9_])strncpy_from_user_nofault\s*\(', '__strncpy_from_user_nofault(', txt)
+              if txt2 != txt:
+                  ev.write_text(txt2)
+                  print("[PASS] Patched __strncpy_from_user_nofault in sulog/event.c")
+
+          # 4. Neutralize legacy ksu_handle_devpts in fs/devpts/inode.c
+          dp = pathlib.Path("fs/devpts/inode.c")
+          if dp.exists():
+              lines = dp.read_text().splitlines(keepends=True)
+              out_lines = []
+              changed = False
+              for l in lines:
+                  if "ksu_handle_devpts" in l and "extern" in l:
+                      out_lines.append("// " + l)
+                      changed = True
+                  elif "ksu_handle_devpts(" in l:
+                      out_lines.append(re.sub(r"ksu_handle_devpts\s*\(", "(void)(", l))
+                      changed = True
+                  else:
+                      out_lines.append(l)
+              if changed:
+                  dp.write_text("".join(out_lines))
+                  print("[PASS] Neutralized legacy ksu_handle_devpts in fs/devpts/inode.c")
+
+          # 5. Wire ksu_handle_sys_reboot in kernel/reboot.c
+          reb_p = pathlib.Path("kernel/reboot.c")
+          reb = reb_p.read_text()
+          if "ksu_handle_sys_reboot" not in reb:
+              anchor = "SYSCALL_DEFINE4(reboot,"
+              cap_anchor = "\tif (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))"
+              assert anchor in reb and cap_anchor in reb, "kernel/reboot.c anchors missing"
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n\n"
+              hook = "#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n"
+              reb = reb.replace(anchor, decl + anchor, 1).replace(cap_anchor, hook + cap_anchor, 1)
+              reb_p.write_text(reb)
+              print("[PASS] Wired ksu_handle_sys_reboot in kernel/reboot.c")
+
+          # 6. Relax init/Kconfig KALLSYMS_ALL dependency
+          ik_p = pathlib.Path("init/Kconfig")
+          ik = ik_p.read_text()
+          ik2 = re.sub(r'(config KALLSYMS_ALL\n\s+bool "Include all symbols in kallsyms"\n\s+)depends on DEBUG_KERNEL && KALLSYMS', r'\1depends on KALLSYMS', ik)
+          if ik2 != ik:
+              ik_p.write_text(ik2)
+              print("[PASS] Relaxed init/Kconfig KALLSYMS_ALL dependency")
+
+          # 7. Restore stock Linux 4.19 8-byte kallsyms_markers (PTR / unsigned long)
+          sk_p = pathlib.Path("scripts/kallsyms.c")
+          sk = sk_p.read_text()
+          m_idx = sk.find('output_label("kallsyms_markers")')
+          if m_idx != -1:
+              tail = sk[m_idx:]
+              tail2 = tail.replace('\\t.long\\t%u\\n', '\\tPTR\\t%u\\n', 1).replace('\\t.long\\t%d\\n', '\\tPTR\\t%d\\n', 1)
+              if tail2 != tail:
+                  sk_p.write_text(sk[:m_idx] + tail2)
+                  print("[PASS] Patched scripts/kallsyms.c kallsyms_markers to PTR (8-byte)")
+          kk_p = pathlib.Path("kernel/kallsyms.c")
+          kk = kk_p.read_text()
+          kk2 = re.sub(r'\b(const\s+)(?:unsigned\s+int|u32)(\s+kallsyms_markers\s*\[)', r'\1unsigned long\2', kk)
+          if kk2 != kk:
+              kk_p.write_text(kk2)
+              print("[PASS] Patched kernel/kallsyms.c kallsyms_markers to unsigned long")
+
+          # 8. Inject SukiSU-Ultra + KPM flags (Zero SUSFS) into vendor/pipa_defconfig
+          dc_p = pathlib.Path("arch/arm64/configs/vendor/pipa_defconfig")
+          dc = "\n".join(l for l in dc_p.read_text().splitlines() if "SUSFS" not in l) + "\n"
+          opts = [
+              "CONFIG_KSU=y",
+              "CONFIG_KPM=y",
+              "CONFIG_KALLSYMS=y",
+              "CONFIG_KALLSYMS_ALL=y",
+              "CONFIG_OVERLAY_FS=y",
+              "# CONFIG_TRIM_UNUSED_KSYMS is not set",
+              "# CONFIG_KSU_SUSFS is not set",
+          ]
+          for opt in opts:
+              key = opt.split("=")[0].replace("# ", "").replace(" is not set", "")
+              if re.search(rf"^(# )?{re.escape(key)}[= ]", dc, re.M):
+                  dc = re.sub(rf"^(# )?{re.escape(key)}[= ].*$", opt, dc, flags=re.M)
+              else:
+                  dc += f"\n{opt}\n"
+          dc_p.write_text(dc)
+          print("[PASS] Updated vendor/pipa_defconfig (SukiSU + KPM, zero SUSFS)")
+          PYEOF
+
+      - name: Free disk space & install build dependencies
+        run: |
+          sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq bc bison build-essential ccache cpio curl flex git \
+            kmod libelf-dev libssl-dev llvm lld python3 python3-pip unzip xz-utils zip zstd
+
+      - name: Download AOSP Clang (clang-r522817, fallback clang-r547379)
+        run: |
+          mkdir -p "$HOME/clang"
+          CLANG_REV="clang-r522817"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_REV}.tar.gz"
+          if ! curl -fsSL "$URL" -o "$HOME/clang.tar.gz"; then
+            CLANG_REV="clang-r547379"
+            URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/${CLANG_REV}.tar.gz"
+            curl -fsSL "$URL" -o "$HOME/clang.tar.gz"
+          fi
+          tar -xzf "$HOME/clang.tar.gz" -C "$HOME/clang"
+          rm -f "$HOME/clang.tar.gz"
+          echo "CLANG_REV=${CLANG_REV}" >> "$GITHUB_ENV"
+          echo "$HOME/clang/bin" >> "$GITHUB_PATH"
+          "$HOME/clang/bin/clang" --version | head -n 2
+
+      - name: Build N0Kernel r1 + SukiSU-Ultra KPM (LTO_NONE, Zero SUSFS)
+        run: |
+          set -euo pipefail
+          cd kernel
+          MAKE_ARGS="O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          make -j"$(nproc)" $MAKE_ARGS vendor/pipa_defconfig
+          scripts/config --file out/.config --set-str LOCALVERSION "-sukisu-kpm"
+          scripts/config --file out/.config \
+            -e KSU \
+            -e KPM \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL \
+            -e LTO_NONE \
+            -d KSU_SUSFS \
+            -d TRIM_UNUSED_KSYMS \
+            -d LTO \
+            -d LTO_CLANG \
+            -d LTO_CLANG_THIN \
+            -d LTO_CLANG_FULL \
+            -d THINLTO \
+            -d CFI_CLANG \
+            -d CFI_PERMISSIVE \
+            -d LD_DEAD_CODE_DATA_ELIMINATION
+          make -j"$(nproc)" $MAKE_ARGS olddefconfig
+          grep -E 'CONFIG_(LOCALVERSION|KSU|KPM|KALLSYMS|LTO|CFI|TRIM_UNUSED_KSYMS|SUSFS)' out/.config | sort | tee ../config-audit.txt
+          grep -q '^CONFIG_KSU=y$' out/.config
+          grep -q '^CONFIG_KPM=y$' out/.config
+          grep -q '^CONFIG_KALLSYMS=y$' out/.config
+          grep -q '^CONFIG_KALLSYMS_ALL=y$' out/.config
+          grep -q '^CONFIG_LTO_NONE=y$' out/.config
+          ! grep -q '^CONFIG_LTO_CLANG_THIN=y$' out/.config
+          ! grep -qE '^CONFIG_KSU_SUSFS.*=y$' out/.config
+          make -j"$(nproc)" $MAKE_ARGS Image 2>&1 | tee ../build.log
+          test -s out/arch/arm64/boot/Image
+          ls -lh out/arch/arm64/boot/Image
+
+      - name: Patch Image with SukiSU_patch kpm/patch_linux & compress to Image.gz
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/SukiSU-Ultra/SukiSU_patch.git sukisu_patch
+          PATCH_COMMIT="$(git -C sukisu_patch rev-parse HEAD)"
+          echo "PATCH_COMMIT=${PATCH_COMMIT}" >> "$GITHUB_ENV"
+          echo "SukiSU_patch commit: ${PATCH_COMMIT}"
+          cd kernel/out/arch/arm64/boot
+          cp "$GITHUB_WORKSPACE/sukisu_patch/kpm/patch_linux" ./patch_linux
+          chmod +x ./patch_linux
+          ./patch_linux | tee "$GITHUB_WORKSPACE/kpm-patch.log"
+          test -s oImage
+          # Verify ARM64 Image magic 'ARMd' at offset 0x38
+          python3 -c 'import sys; d=open("oImage","rb").read(64); assert d[56:60]==b"ARMd", f"Bad ARM64 magic: {d[56:60]!r}"; print("[PASS] oImage ARM64 magic verified: ARMd")'
+          ls -lh Image oImage
+          gzip -9 -c oImage > Image.gz
+          test -s Image.gz
+          ls -lh Image.gz
+
+      - name: Package Image.gz-only AnyKernel3 zip & SHA-256
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3_work
+          rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
+          printf '%s\n' \
+            "### AnyKernel3 Ramdisk Mod Script" \
+            "properties() { '" \
+            "kernel.string=N0Kernel r1 + SukiSU-Ultra KPM (LTO_NONE, patch_linux, No SUSFS) for pipa" \
+            "do.devicecheck=1" \
+            "do.modules=0" \
+            "do.systemless=1" \
+            "do.cleanup=1" \
+            "do.cleanuponabort=0" \
+            "device.name1=pipa" \
+            "supported.versions=13-16" \
+            "supported.patchlevels=" \
+            "'; }" \
+            "" \
+            "BLOCK=boot;" \
+            "block=boot;" \
+            "IS_SLOT_DEVICE=1;" \
+            "is_slot_device=1;" \
+            "RAMDISK_COMPRESSION=auto;" \
+            "ramdisk_compression=auto;" \
+            "PATCH_VBMETA_FLAG=auto;" \
+            "patch_vbmeta_flag=auto;" \
+            "" \
+            ". tools/ak3-core.sh;" \
+            "" \
+            "split_boot;" \
+            "flash_boot;" > ak3_work/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
+          ZIP_NAME="N0Kernel-SukiSU-KPM-LTO_NONE-noSUSFS-pipa-AnyKernel3.zip"
+          (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
+          unzip -l "${ZIP_NAME}"
+          if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
+            echo "ERROR: Forbidden raw Image/dtb/dtbo.img in ${ZIP_NAME}" >&2
+            exit 1
+          fi
+          sha256sum "${ZIP_NAME}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: n0kernel-sukisu-kpm-nosusfs-pipa
+          path: |
+            N0Kernel-SukiSU-KPM-LTO_NONE-noSUSFS-pipa-AnyKernel3.zip
+            SHA256SUMS.txt
+            config-audit.txt
+            kpm-patch.log
+
+      - name: Publish GitHub Release (n0-sukisu-kpm-nosusfs-v1)
+        if: ${{ github.event.inputs.publish_release != 'false' }}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="n0-sukisu-kpm-nosusfs-v1"
+          ZIP_NAME="N0Kernel-SukiSU-KPM-LTO_NONE-noSUSFS-pipa-AnyKernel3.zip"
+          SHA_LINE="$(cat SHA256SUMS.txt)"
+          printf '%s\n' \
+            "## N0Kernel r1 + SukiSU-Ultra KPM (LTO_NONE + patch_linux, Zero SUSFS) for Xiaomi Pad 6 (pipa)" \
+            "" \
+            "- **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_COMMIT}\`)" \
+            "- **Root + KPM:** SukiSU-Ultra \`builtin\` (\`${SUKISU_COMMIT}\`), \`CONFIG_KSU=y\`, \`CONFIG_KPM=y\`" \
+            "- **KPM Image Patch:** SukiSU_patch \`kpm/patch_linux\` (\`${PATCH_COMMIT}\`) verified on \`Image\` -> \`oImage\` -> \`Image.gz\`" \
+            "- **LTO & Symbols:** \`CONFIG_LTO_NONE=y\`, \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, 8-byte \`kallsyms_markers\` (\`LOCALVERSION=-sukisu-kpm\`)" \
+            "- **SUSFS:** Completely disabled/removed (\`# CONFIG_KSU_SUSFS is not set\`)" \
+            "- **Toolchain:** Google AOSP Clang \`${CLANG_REV}\`" \
+            "- **Packaging:** \`Image.gz\`-only AnyKernel3 (\`BLOCK=boot\`, \`IS_SLOT_DEVICE=1\`, \`split_boot; flash_boot;\`)" \
+            "" \
+            "### SHA-256 Checksum" \
+            '```' \
+            "${SHA_LINE}" \
+            '```' > release-notes.md
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ZIP_NAME}" SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
+          else
+            gh release create "$TAG" "${ZIP_NAME}" SHA256SUMS.txt \
+              --title "N0Kernel r1 + SukiSU-Ultra KPM (LTO_NONE, No SUSFS, pipa)" \
+              --notes-file release-notes.md
+          fi
