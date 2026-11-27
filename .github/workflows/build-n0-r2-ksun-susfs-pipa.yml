@@ -206,7 +206,7 @@ jobs:
           cd kernel
           MAKE_ARGS="O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make -j"$(nproc)" $MAKE_ARGS vendor/pipa_defconfig
-          scripts/config --file out/.config --set-str LOCALVERSION "-r2-ksun-kpm2"
+          scripts/config --file out/.config --set-str LOCALVERSION "-r2-ksun-kpm3"
           scripts/config --file out/.config \
             -e KSU \
             -e KALLSYMS \
@@ -220,9 +220,13 @@ jobs:
             -d THINLTO \
             -d CFI_CLANG \
             -d CFI_PERMISSIVE \
+            -d RANDOMIZE_BASE \
+            -d RELOCATABLE \
+            -d RELR \
+            -d RANDOMIZE_MODULE_REGION_FULL \
             -d LD_DEAD_CODE_DATA_ELIMINATION
           make -j"$(nproc)" $MAKE_ARGS olddefconfig
-          grep -E 'CONFIG_(LOCALVERSION|KSU|KALLSYMS|LTO|CFI|TRIM_UNUSED_KSYMS|SUSFS)' out/.config | sort | tee ../config-audit.txt
+          grep -E 'CONFIG_(LOCALVERSION|KSU|KALLSYMS|LTO|CFI|TRIM_UNUSED_KSYMS|SUSFS|RANDOMIZE_BASE|RELOCATABLE|RELR)' out/.config | sort | tee ../config-audit.txt
           grep -q '^CONFIG_KSU=y$' out/.config
           grep -q '^CONFIG_KALLSYMS=y$' out/.config
           grep -q '^CONFIG_KALLSYMS_ALL=y$' out/.config
@@ -230,6 +234,9 @@ jobs:
           ! grep -q '^CONFIG_LTO=y$' out/.config
           ! grep -q '^CONFIG_LTO_CLANG=y$' out/.config
           ! grep -qE '^CONFIG_.*SUSFS.*=y$' out/.config
+          ! grep -q '^CONFIG_RANDOMIZE_BASE=y$' out/.config
+          ! grep -q '^CONFIG_RELOCATABLE=y$' out/.config
+          ! grep -q '^CONFIG_RELR=y$' out/.config
           make -j"$(nproc)" $MAKE_ARGS Image.gz 2>&1 | tee ../build.log
           test -s out/arch/arm64/boot/Image.gz
           ls -lh out/arch/arm64/boot/Image.gz
@@ -291,7 +298,7 @@ jobs:
             "flash_boot;" > ak3_work/anykernel.sh
           cat ak3_work/anykernel.sh
           cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
-          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-v2-noSUSFS-pipa-AnyKernel3.zip"
+          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-v3-noSUSFS-pipa-AnyKernel3.zip"
           (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
           unzip -l "${ZIP_NAME}"
           if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
@@ -307,19 +314,19 @@ jobs:
           name: n0kernel-r2-ksun-kpm-nosusfs-pipa
           if-no-files-found: ignore
           path: |
-            N0Kernel-r2-KSUN-v3.1.0-KPM-v2-noSUSFS-pipa-AnyKernel3.zip
+            N0Kernel-r2-KSUN-v3.1.0-KPM-v3-noSUSFS-pipa-AnyKernel3.zip
             SHA256SUMS.txt
             abi-gate.txt
             config-audit.txt
 
-      - name: Publish GitHub Release (r2-ksun-kpm-v2)
+      - name: Publish GitHub Release (r2-ksun-kpm-v3)
         if: ${{ github.event.inputs.publish_release != 'false' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="r2-ksun-kpm-v2"
-          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-v2-noSUSFS-pipa-AnyKernel3.zip"
+          TAG="r2-ksun-kpm-v3"
+          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-v3-noSUSFS-pipa-AnyKernel3.zip"
           R1_C="${R1_COMMIT:-e6708914262c72b3e7eea0433ee5c33b9029e32f}"
           K_TAG="${KSUN_TAG:-v3.1.0-legacy}"
           K_C="${KSUN_COMMIT:-1ce19e536de730829b62d0d23dbd96c6ec809e2f}"
@@ -331,7 +338,7 @@ jobs:
             "- **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_C}\`)" \
             "- **KernelSU-Next:** \`${K_TAG}\` (\`${K_C}\`)" \
             "- **SUSFS:** Completely removed (zero SUSFS files, headers, patches, or config flags)" \
-            "- **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, \`CONFIG_LTO_NONE=y\` (\`LOCALVERSION=-r2-ksun-kpm2\`)" \
+            "- **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, \`CONFIG_LTO_NONE=y\`, \`CONFIG_RANDOMIZE_BASE=n\`, \`CONFIG_RELOCATABLE=n\`, \`CONFIG_RELR=n\` (\`LOCALVERSION=-r2-ksun-kpm3\`)" \
             "- **Toolchain:** Google AOSP Clang \`${CL_R}\`" \
             "- **Packaging:** \`Image.gz\`-only AnyKernel3 (\`BLOCK=boot\`, \`IS_SLOT_DEVICE=1\`, \`split_boot; flash_boot;\`)" \
             "" \
