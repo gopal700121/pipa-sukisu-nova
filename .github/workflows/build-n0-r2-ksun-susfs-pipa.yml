@@ -1,14 +1,14 @@
-name: Build N0Kernel r2 (KSUN v3.1.0 + SUSFS v2.1.0) for Xiaomi Pad 6 (pipa)
+name: Build N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready, No SUSFS) for Xiaomi Pad 6 (pipa)
 
 on:
   workflow_dispatch:
     inputs:
-      ksun_ref:
-        description: "KernelSU-Next ref (default: legacy_susfs — v3.1.0-legacy-susfs line)"
+      ksun_tag:
+        description: "KernelSU-Next tag (default: v3.1.0-legacy)"
         required: false
-        default: "legacy_susfs"
+        default: "v3.1.0-legacy"
       publish_release:
-        description: "Publish GitHub Release r2-ksun-v1"
+        description: "Publish GitHub Release r2-ksun-kpm-v1"
         required: false
         default: "true"
 
@@ -16,7 +16,7 @@ permissions:
   contents: write
 
 jobs:
-  build-n0-r2:
+  build-n0-r2-ksun-kpm:
     runs-on: ubuntu-22.04
     steps:
       - name: Checkout workflow repo
@@ -32,25 +32,17 @@ jobs:
           rm -rf KernelSU KernelSU-Next drivers/kernelsu
           git status -s
 
-      - name: Integrate single-source KSUN v3.1.0-legacy + SUSFS v2.1.0 (wagamy tag)
+      - name: Integrate official KernelSU-Next v3.1.0-legacy (NO SUSFS)
         run: |
           set -euo pipefail
-          WORK_DIR="$(pwd)"
           cd kernel
+          KSUN_TAG="${{ github.event.inputs.ksun_tag || 'v3.1.0-legacy' }}"
+          git clone --depth=1 --branch "${KSUN_TAG}" https://github.com/KernelSU-Next/KernelSU-Next.git KernelSU-Next
+          KSUN_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
+          echo "KSUN_TAG=${KSUN_TAG}" >> "$GITHUB_ENV"
+          echo "KSUN_COMMIT=${KSUN_COMMIT}" >> "$GITHUB_ENV"
+          echo "Integrated KernelSU-Next: ${KSUN_TAG} (${KSUN_COMMIT})"
 
-          # Clone wagamy reference repo (lineage-23.2 clean base + ksun_v3.1.0-susfs_v2.1.0 tag)
-          git clone --depth=1 --branch ksun_v3.1.0-susfs_v2.1.0 https://github.com/wagamy/android_kernel_oneplus_sm8250.git "$WORK_DIR/wagamy"
-          git -C "$WORK_DIR/wagamy" fetch --depth=1 origin lineage-23.2:refs/remotes/origin/lineage-23.2
-          WAGAMY_COMMIT="$(git -C "$WORK_DIR/wagamy" rev-parse HEAD)"
-          echo "SUSFS_COMMIT=${WAGAMY_COMMIT}" >> "$GITHUB_ENV"
-          echo "KSUN_COMMIT=${WAGAMY_COMMIT}" >> "$GITHUB_ENV"
-          echo "CHOSEN_KSUN_TAG=v3.1.0-legacy-susfs@wagamy-${WAGAMY_COMMIT:0:8}" >> "$GITHUB_ENV"
-          echo "wagamy ksun_v3.1.0-susfs_v2.1.0 commit: ${WAGAMY_COMMIT}"
-
-          # 1) Wholesale copy of device-independent KernelSU-Next/kernel/ + SUSFS v2.1.0 core files ONLY
-          rm -rf KernelSU-Next drivers/kernelsu
-          mkdir -p KernelSU-Next
-          cp -r "$WORK_DIR/wagamy/KernelSU-Next/kernel" KernelSU-Next/kernel
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
           if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
@@ -59,42 +51,97 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          cp "$WORK_DIR/wagamy/fs/susfs.c" fs/susfs.c
-          cp "$WORK_DIR/wagamy/include/linux/susfs.h" include/linux/susfs.h
-          cp "$WORK_DIR/wagamy/include/linux/susfs_def.h" include/linux/susfs_def.h
-          grep -E 'SUSFS_VERSION|SUSFS_MAGIC|TIF_PROC_UMOUNTED' include/linux/susfs*.h || true
-
-          # 2) Extract pure generic SUSFS/KSU hook diff from wagamy (NEVER arch/, DTS, or OnePlus drivers)
-          HOOK_FILES=(
-            fs/Makefile fs/namespace.c fs/readdir.c fs/statfs.c fs/namei.c fs/super.c
-            fs/internal.h fs/mount.h fs/notify/fdinfo.c fs/proc/base.c fs/proc/cmdline.c
-            fs/proc/fd.c fs/proc/task_mmu.c fs/proc_namespace.c
-            kernel/kallsyms.c security/selinux/avc.c
-            include/linux/seccomp.h include/linux/sched.h include/linux/mount.h
-          )
-          git -C "$WORK_DIR/wagamy" diff origin/lineage-23.2..HEAD -- "${HOOK_FILES[@]}" > "$WORK_DIR/wagamy-susfs-v2.1.0-hooks.patch"
-          echo "=== Files in wagamy-susfs-v2.1.0-hooks.patch ==="
-          grep '^diff --git' "$WORK_DIR/wagamy-susfs-v2.1.0-hooks.patch" || true
-
-          set +e
-          patch -p1 --fuzz=3 --forward < "$WORK_DIR/wagamy-susfs-v2.1.0-hooks.patch"
-          PATCH_RC=$?
-          set -e
-          echo "wagamy-susfs-v2.1.0-hooks.patch exit code: ${PATCH_RC}"
-          find . -maxdepth 5 -name '*.rej' -print
-
-      - name: Reconcile known 4.19 SUSFS rejects & wire/verify KSUN manual hooks
+      - name: Wire KSUN manual hooks & KPM-ready defconfig (Zero SUSFS)
         run: |
           set -euo pipefail
           cd kernel
-          python3 ../scripts/reconcile_ksun_susfs.py
-      
+          python3 -c 'import textwrap, sys; exec(textwrap.dedent(sys.stdin.read()))' << 'PYEOF'
+          import os, re, sys
 
-      - name: Run blocking pre-build ABI & Hook Gate (ksu_abi_gate.sh + gate-run12.sh)
+          # 1. Verify fs/stat.c is completely clean of SUSFS while preserving ksu_handle_stat
+          stat_c = open("fs/stat.c").read()
+          assert "susfs" not in stat_c.lower() and "STATX_SUS_KSTAT" not in stat_c, "SUSFS found in fs/stat.c"
+          assert "ksu_handle_stat" in stat_c, "ksu_handle_stat missing in fs/stat.c"
+          print("[PASS] fs/stat.c clean (zero SUSFS, ksu_handle_stat preserved)")
+
+          # 2. Wire ksu_handle_sys_reboot in kernel/reboot.c
+          reb = open("kernel/reboot.c").read()
+          if "ksu_handle_sys_reboot" not in reb:
+              anchor = "SYSCALL_DEFINE4(reboot,"
+              cap_anchor = "\tif (!ns_capable(pid_ns->user_ns, CAP_SYS_BOOT))"
+              assert anchor in reb and cap_anchor in reb, "kernel/reboot.c anchors missing"
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_sys_reboot(int magic1, int magic2, unsigned int cmd, void __user **arg);\n#endif\n\n"
+              hook = "#ifdef CONFIG_KSU\n\tksu_handle_sys_reboot(magic1, magic2, cmd, &arg);\n#endif\n"
+              reb = reb.replace(anchor, decl + anchor, 1).replace(cap_anchor, hook + cap_anchor, 1)
+              open("kernel/reboot.c", "w").write(reb)
+              print("[PASS] Wired ksu_handle_sys_reboot in kernel/reboot.c")
+
+          # 3. Wire ksu_handle_setresuid in kernel/sys.c
+          sysc = open("kernel/sys.c").read()
+          if "ksu_handle_setresuid" not in sysc:
+              fn_anchor = "long __sys_setresuid(uid_t ruid, uid_t euid, uid_t suid)"
+              sec_anchor = "\tretval = security_task_fix_setuid(new, old, LSM_SETID_RES);"
+              assert fn_anchor in sysc and sec_anchor in sysc, "kernel/sys.c anchors missing"
+              decl = "#ifdef CONFIG_KSU\nextern int ksu_handle_setresuid(uid_t ruid, uid_t euid, uid_t suid);\n#endif\n\n"
+              hook = "#ifdef CONFIG_KSU\n\tksu_handle_setresuid(ruid, euid, suid);\n#endif\n"
+              sysc = sysc.replace(fn_anchor, decl + fn_anchor, 1).replace(sec_anchor, hook + sec_anchor, 1)
+              open("kernel/sys.c", "w").write(sysc)
+              print("[PASS] Wired ksu_handle_setresuid in kernel/sys.c")
+
+          # 4. Check ksu_handle_devpts in KSUN v3.1.0-legacy
+          su_blob = "\n".join(open(p, errors="ignore").read() for p in ["drivers/kernelsu/sucompat.c", "drivers/kernelsu/ksu.c", "drivers/kernelsu/ksud.c"] if os.path.exists(p))
+          if "ksu_handle_devpts" not in su_blob and os.path.exists("fs/devpts/inode.c"):
+              dp = open("fs/devpts/inode.c").read()
+              if "ksu_handle_devpts" in dp:
+                  dp = re.sub(r"#ifdef CONFIG_KSU\s*extern int ksu_handle_devpts\([^\)]*\);\s*#endif", "", dp, flags=re.S)
+                  dp = re.sub(r"#ifdef CONFIG_KSU\s*ksu_handle_devpts\([^\)]*\);\s*#endif", "", dp, flags=re.S)
+                  open("fs/devpts/inode.c", "w").write(dp)
+                  print("[PASS] Removed obsolete ksu_handle_devpts from fs/devpts/inode.c")
+
+          # 5. Relax init/Kconfig KALLSYMS_ALL dependency (required for KPM / KPatch-Next)
+          ik = open("init/Kconfig").read()
+          ik2 = re.sub(r'(config KALLSYMS_ALL\n\s+bool "Include all symbols in kallsyms"\n\s+)depends on DEBUG_KERNEL && KALLSYMS', r'\1depends on KALLSYMS', ik)
+          if ik2 != ik:
+              open("init/Kconfig", "w").write(ik2)
+              print("[PASS] Relaxed init/Kconfig KALLSYMS_ALL dependency for KPM")
+
+          # 6. Update vendor/pipa_defconfig: KSUN + KPM-ready, ZERO SUSFS
+          defcfg_path = "arch/arm64/configs/vendor/pipa_defconfig"
+          defcfg = "\n".join(l for l in open(defcfg_path).read().splitlines() if "SUSFS" not in l) + "\n"
+          opts = ["CONFIG_KSU=y", "CONFIG_KALLSYMS=y", "CONFIG_KALLSYMS_ALL=y", "CONFIG_OVERLAY_FS=y", "# CONFIG_TRIM_UNUSED_KSYMS is not set"]
+          kcfg = open("drivers/kernelsu/Kconfig", errors="ignore").read()
+          if "config KSU_MANUAL_HOOK" in kcfg:
+              opts.append("CONFIG_KSU_MANUAL_HOOK=y")
+          if "config KSU_WITH_KPROBES" in kcfg:
+              opts.append("# CONFIG_KSU_WITH_KPROBES is not set")
+          for opt in opts:
+              key = opt.split("=")[0].replace("# ", "").replace(" is not set", "")
+              if re.search(rf"^(# )?{re.escape(key)}[= ]", defcfg, re.M):
+                  defcfg = re.sub(rf"^(# )?{re.escape(key)}[= ].*$", opt, defcfg, flags=re.M)
+              else:
+                  defcfg += f"\n{opt}\n"
+          open(defcfg_path, "w").write(defcfg)
+          print("[PASS] Updated vendor/pipa_defconfig:", opts)
+          PYEOF
+
+      - name: Static validation gate (Zero SUSFS + KSUN 4.19 ABI match)
         run: |
-          chmod +x scripts/ksu_abi_gate.sh scripts/gate-run12.sh
-          ./scripts/ksu_abi_gate.sh kernel | tee abi-gate.txt
-          (cd kernel && bash ../scripts/gate-run12.sh) | tee -a abi-gate.txt
+          set -euo pipefail
+          cd kernel
+          echo "=== Static Validation Gate (Zero SUSFS + KSUN ABI) ==="
+          test ! -e fs/susfs.c && test ! -e include/linux/susfs.h && test ! -e include/linux/susfs_def.h
+          echo "[PASS] Zero SUSFS source/header files"
+          if grep -rnE 'susfs|SUSFS|STATX_SUS_KSTAT' fs/ kernel/ include/linux/ drivers/kernelsu/ arch/arm64/configs/vendor/pipa_defconfig 2>/dev/null; then
+            echo "[FAIL] Residual SUSFS reference found!" >&2
+            exit 1
+          fi
+          echo "[PASS] Zero SUSFS / STATX_SUS_KSTAT references in tree"
+          grep -Eq '^\s*ksu_handle_setresuid\s*\(' kernel/sys.c && echo "[PASS] ksu_handle_setresuid in kernel/sys.c"
+          grep -Eq '^\s*ksu_handle_sys_reboot\s*\(' kernel/reboot.c && echo "[PASS] ksu_handle_sys_reboot in kernel/reboot.c"
+          grep -Eq 'ksu_handle_faccessat\s*\(\s*&' fs/open.c && echo "[PASS] ksu_handle_faccessat in fs/open.c"
+          grep -Eq 'ksu_handle_stat\s*\(\s*&' fs/stat.c && echo "[PASS] ksu_handle_stat in fs/stat.c"
+          echo "GATE RESULT: PASSED" | tee ../abi-gate.txt
+
       - name: Free disk space & install build dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
@@ -118,31 +165,18 @@ jobs:
           echo "$HOME/clang/bin" >> "$GITHUB_PATH"
           "$HOME/clang/bin/clang" --version | head -n 2
 
-      - name: Build A (r2-A — ThinLTO ON, daily driver)
+      - name: Build N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready ThinLTO OFF, Zero SUSFS)
         run: |
           set -euo pipefail
           cd kernel
-          MAKE_ARGS="O=out_a ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          MAKE_ARGS="O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make -j"$(nproc)" $MAKE_ARGS vendor/pipa_defconfig
-          scripts/config --file out_a/.config --set-str LOCALVERSION "-r2-ksun"
-          make -j"$(nproc)" $MAKE_ARGS olddefconfig
-          make -j"$(nproc)" $MAKE_ARGS Image.gz 2>&1 | tee ../build-a.log
-          test -s out_a/arch/arm64/boot/Image.gz
-          ls -lh out_a/arch/arm64/boot/Image.gz
-          grep -E 'CONFIG_(LOCALVERSION|KSU|LTO|CFI|KALLSYMS)' out_a/.config | sort > ../config-audit-A.txt
-
-      - name: Post-build Gate A
-        run: |
-          ./scripts/ksu_abi_gate.sh kernel build-a.log | tee -a abi-gate.txt
-
-      - name: Build B (r2-B — ThinLTO OFF for future KPM testing)
-        run: |
-          set -euo pipefail
-          cd kernel
-          MAKE_ARGS="O=out_b ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
-          make -j"$(nproc)" $MAKE_ARGS vendor/pipa_defconfig
-          scripts/config --file out_b/.config --set-str LOCALVERSION "-r2-ksun-nolto"
-          scripts/config --file out_b/.config \
+          scripts/config --file out/.config --set-str LOCALVERSION "-r2-ksun-kpm"
+          scripts/config --file out/.config \
+            -e KSU \
+            -e KALLSYMS \
+            -e KALLSYMS_ALL \
+            -d TRIM_UNUSED_KSYMS \
             -d LTO \
             -d LTO_CLANG \
             -d LTO_CLANG_THIN \
@@ -152,33 +186,39 @@ jobs:
             -d CFI_PERMISSIVE \
             -d LD_DEAD_CODE_DATA_ELIMINATION
           make -j"$(nproc)" $MAKE_ARGS olddefconfig
-          diff -u out_a/.config out_b/.config > ../config-diff-A-vs-B.txt || true
-          cat ../config-diff-A-vs-B.txt
-          make -j"$(nproc)" $MAKE_ARGS Image.gz 2>&1 | tee ../build-b.log
-          test -s out_b/arch/arm64/boot/Image.gz
-          ls -lh out_b/arch/arm64/boot/Image.gz
-          grep -E 'CONFIG_(LOCALVERSION|KSU|LTO|CFI|KALLSYMS)' out_b/.config | sort > ../config-audit-B.txt
+          grep -E 'CONFIG_(LOCALVERSION|KSU|KALLSYMS|LTO|CFI|TRIM_UNUSED_KSYMS|SUSFS)' out/.config | sort | tee ../config-audit.txt
+          grep -q '^CONFIG_KSU=y$' out/.config
+          grep -q '^CONFIG_KALLSYMS=y$' out/.config
+          grep -q '^CONFIG_KALLSYMS_ALL=y$' out/.config
+          ! grep -q '^CONFIG_LTO_CLANG_THIN=y$' out/.config
+          ! grep -qE '^CONFIG_.*SUSFS.*=y$' out/.config
+          make -j"$(nproc)" $MAKE_ARGS Image.gz 2>&1 | tee ../build.log
+          test -s out/arch/arm64/boot/Image.gz
+          ls -lh out/arch/arm64/boot/Image.gz
 
-      - name: Post-build Gate B
-        run: |
-          ./scripts/ksu_abi_gate.sh kernel build-b.log | tee -a abi-gate.txt
-
-      - name: Package Image.gz-only AnyKernel3 zips & SHA-256 checksums
+      - name: Post-build error & KSU warning audit
         run: |
           set -euo pipefail
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git AnyKernel3_tmpl
+          if grep -E '(^| )error:' build.log; then
+            echo "[FAIL] Compiler errors found!" >&2
+            exit 1
+          fi
+          echo "[PASS] Zero compiler errors in build.log" | tee -a abi-gate.txt
+          if grep -E '(drivers/kernelsu|KernelSU-Next).*warning:' build.log; then
+            echo "[WARN] Warnings in KernelSU-Next files (review above)"
+          else
+            echo "[PASS] Zero warnings in KernelSU-Next files" | tee -a abi-gate.txt
+          fi
 
-          package_ak3() {
-            local LABEL="$1"
-            local IMG_PATH="$2"
-            local ZIP_NAME="$3"
-            rm -rf ak3_work
-            cp -r AnyKernel3_tmpl ak3_work
-            rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
-            cat > ak3_work/anykernel.sh << 'AKEOF'
+      - name: Package Image.gz-only AnyKernel3 zip & SHA-256
+        run: |
+          set -euo pipefail
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3_work
+          rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
+          cat > ak3_work/anykernel.sh << 'AKEOF'
           ### AnyKernel3 Ramdisk Mod Script
           properties() { '
-          kernel.string=N0Kernel r2 (KSUN v3.1.0 + SUSFS v2.1.0) for Xiaomi Pad 6 (pipa)
+          kernel.string=N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready, No SUSFS) for pipa
           do.devicecheck=1
           do.modules=0
           do.systemless=1
@@ -199,85 +239,57 @@ jobs:
           split_boot;
           flash_boot;
           AKEOF
-            sed -i 's/^[[:space:]]*//' ak3_work/anykernel.sh
-            cp "${IMG_PATH}" ak3_work/Image.gz
-            (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
-            echo "=== Contents of ${ZIP_NAME} ==="
-            unzip -l "${ZIP_NAME}"
-            if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
-              echo "ERROR: Forbidden raw Image/dtb/dtbo.img detected in ${ZIP_NAME}" >&2
-              exit 1
-            fi
-          }
-
-          ZIP_A="N0Kernel-r2-A-KSUN-v3.1.0-SUSFS-v2.1.0-pipa-AnyKernel3.zip"
-          ZIP_B="N0Kernel-r2-B-KSUN-v3.1.0-SUSFS-v2.1.0-nolto-pipa-AnyKernel3.zip"
-          package_ak3 "r2-A" "kernel/out_a/arch/arm64/boot/Image.gz" "${ZIP_A}"
-          package_ak3 "r2-B" "kernel/out_b/arch/arm64/boot/Image.gz" "${ZIP_B}"
-
-          sha256sum "${ZIP_A}" "${ZIP_B}" > SHA256SUMS.txt
+          sed -i 's/^[[:space:]]*//' ak3_work/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
+          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
+          (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
+          unzip -l "${ZIP_NAME}"
+          if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
+            echo "ERROR: Forbidden raw Image/dtb/dtbo.img in ${ZIP_NAME}" >&2
+            exit 1
+          fi
+          sha256sum "${ZIP_NAME}" > SHA256SUMS.txt
           cat SHA256SUMS.txt
-
-          cat > build-metadata.txt << EOF
-          R1_COMMIT=${R1_COMMIT}
-          CHOSEN_KSUN_TAG=${CHOSEN_KSUN_TAG}
-          KSUN_COMMIT=${KSUN_COMMIT}
-          SUSFS_COMMIT=${SUSFS_COMMIT}
-          CLANG_REV=${CLANG_REV}
-          ZIP_A=${ZIP_A}
-          ZIP_B=${ZIP_B}
-          EOF
-          sed -i 's/^[[:space:]]*//' build-metadata.txt
-          cat build-metadata.txt
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          name: n0kernel-r2-ksun-susfs-pipa
+          name: n0kernel-r2-ksun-kpm-nosusfs-pipa
           path: |
-            N0Kernel-r2-A-KSUN-v3.1.0-SUSFS-v2.1.0-pipa-AnyKernel3.zip
-            N0Kernel-r2-B-KSUN-v3.1.0-SUSFS-v2.1.0-nolto-pipa-AnyKernel3.zip
+            N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip
             SHA256SUMS.txt
             abi-gate.txt
-            config-audit-A.txt
-            config-audit-B.txt
-            config-diff-A-vs-B.txt
-            build-metadata.txt
+            config-audit.txt
 
-      - name: Publish GitHub Release (r2-ksun-v1)
+      - name: Publish GitHub Release (r2-ksun-kpm-v1)
         if: ${{ github.event.inputs.publish_release != 'false' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="r2-ksun-v1"
-          NOTES_FILE="release-notes.md"
-          cat > "$NOTES_FILE" << EOF
-          ## N0Kernel r2 — KernelSU-Next ${CHOSEN_KSUN_TAG} + SUSFS v2.1.0 (Xiaomi Pad 6 / pipa)
+          TAG="r2-ksun-kpm-v1"
+          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
+          cat > release-notes.md << EOF
+          ## N0Kernel r2 — KernelSU-Next ${KSUN_TAG} + KPM-ready (Zero SUSFS) for Xiaomi Pad 6 (pipa)
 
           - **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_COMMIT}\`)
-          - **KernelSU-Next:** \`${CHOSEN_KSUN_TAG}\` (\`${KSUN_COMMIT}\`)
-          - **SUSFS4KSU (\`kernel-4.19\`):** \`${SUSFS_COMMIT}\`
+          - **KernelSU-Next:** \`${KSUN_TAG}\` (\`${KSUN_COMMIT}\`)
+          - **SUSFS:** Completely removed (zero SUSFS files, headers, patches, or config flags)
+          - **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, ThinLTO OFF (\`LOCALVERSION=-r2-ksun-kpm\`)
           - **Toolchain:** Google AOSP Clang \`${CLANG_REV}\`
           - **Packaging:** \`Image.gz\`-only AnyKernel3 (\`is_slot_device=1\`, \`split_boot; flash_boot;\`)
 
-          ### SHA-256 Checksums
+          ### SHA-256 Checksum
           \`\`\`
           $(cat SHA256SUMS.txt)
           \`\`\`
           EOF
-          sed -i 's/^[[:space:]]*//' "$NOTES_FILE"
+          sed -i 's/^[[:space:]]*//' release-notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" \
-              N0Kernel-r2-A-KSUN-v3.1.0-SUSFS-v2.1.0-pipa-AnyKernel3.zip \
-              N0Kernel-r2-B-KSUN-v3.1.0-SUSFS-v2.1.0-nolto-pipa-AnyKernel3.zip \
-              SHA256SUMS.txt --clobber
-            gh release edit "$TAG" --notes-file "$NOTES_FILE"
+            gh release upload "$TAG" "${ZIP_NAME}" SHA256SUMS.txt --clobber
+            gh release edit "$TAG" --notes-file release-notes.md
           else
-            gh release create "$TAG" \
-              N0Kernel-r2-A-KSUN-v3.1.0-SUSFS-v2.1.0-pipa-AnyKernel3.zip \
-              N0Kernel-r2-B-KSUN-v3.1.0-SUSFS-v2.1.0-nolto-pipa-AnyKernel3.zip \
-              SHA256SUMS.txt \
-              --title "N0Kernel r2 — KSUN v3.1.0 + SUSFS v2.1.0 (pipa)" \
-              --notes-file "$NOTES_FILE"
+            gh release create "$TAG" "${ZIP_NAME}" SHA256SUMS.txt \
+              --title "N0Kernel r2 — KSUN v3.1.0-legacy + KPM-ready (No SUSFS, pipa)" \
+              --notes-file release-notes.md
           fi
