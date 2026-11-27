@@ -107,7 +107,30 @@ if "susfs.o" not in fsmk:
     fsmk += "\nobj-$(CONFIG_KSU_SUSFS) += susfs.o\n"
     open("fs/Makefile", "w").write(fsmk)
     print(">>> Added obj-$(CONFIG_KSU_SUSFS) += susfs.o to fs/Makefile")
-
+# 4b. Reconcile fs/namespace.c.rej (Linux 4.19 vfs_kern_mount vs vfs_create_mount)
+if os.path.exists("fs/namespace.c.rej"):
+    print(">>> Reconciling fs/namespace.c.rej (4.19 vfs_kern_mount)")
+    ns = open("fs/namespace.c").read()
+    if "susfs_alloc_non_unshare_ksu_vfsmnt" not in ns:
+        target = "\tmnt = alloc_vfsmnt(name);"
+        assert target in ns, "alloc_vfsmnt(name) anchor missing in fs/namespace.c"
+        replacement = (
+            "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+            "\tif (!READ_ONCE(susfs_is_sdcard_android_data_decrypted) && susfs_is_current_ksu_domain()) {\n"
+            "\t\tmnt = susfs_alloc_non_unshare_ksu_vfsmnt(name);\n"
+            "\t\tgoto bypass_orig_flow;\n"
+            "\t}\n"
+            "#endif\n"
+            "\tmnt = alloc_vfsmnt(name);\n"
+            "#ifdef CONFIG_KSU_SUSFS_SUS_MOUNT\n"
+            "bypass_orig_flow:\n"
+            "#endif"
+        )
+        ns = ns.replace(target, replacement, 1)
+        open("fs/namespace.c", "w").write(ns)
+        os.remove("fs/namespace.c.rej")
+        print(">>> Resolved fs/namespace.c.rej cleanly")
+        
 # 5. Report and fail on any remaining .rej files
 rejs = glob.glob("**/*.rej", recursive=True)
 if rejs:
