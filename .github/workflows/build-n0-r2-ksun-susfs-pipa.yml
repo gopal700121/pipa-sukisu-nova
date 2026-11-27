@@ -225,58 +225,58 @@ jobs:
             echo "[PASS] Zero warnings in KernelSU-Next files" | tee -a abi-gate.txt
           fi
 
-      - env:
+      - name: Package Image.gz-only AnyKernel3 zip & SHA-256
+        env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          name: Package Image.gz-only AnyKernel3 zip & SHA-256
-          run: |
+        run: |
           set -euo pipefail
-          if [ "${{ github.event.inputs.repack_only }}" = "true" ]; then
-            mkdir -p /tmp/repack kernel/out/arch/arm64/boot
-            gh release download r2-ksun-kpm-v1 -p '*.zip' -D /tmp/repack
-            unzip -j /tmp/repack/*.zip Image.gz -d kernel/out/arch/arm64/boot/
-            rm -rf /tmp/repack
+          if [[ "${{ github.event.inputs.repack_only }}" == "true" ]]; then
+            mkdir -p kernel/out/arch/arm64/boot
+            gh release download r2-ksun-kpm-v1 -p '*.zip' -D /tmp/old_ak3 --clobber
+            unzip -j /tmp/old_ak3/*.zip Image.gz -d kernel/out/arch/arm64/boot/
+            ls -lh kernel/out/arch/arm64/boot/Image.gz
           fi
-          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3_work
-          rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
-          cat > ak3_work/anykernel.sh << 'AKEOF'
-          ### AnyKernel3 Ramdisk Mod Script
-          properties() { '
-          kernel.string=N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready, No SUSFS) for pipa
-          do.devicecheck=1
-          do.modules=0
-          do.systemless=1
-          do.cleanup=1
-          do.cleanuponabort=0
-          device.name1=pipa
-          supported.versions=13-16
-          supported.patchlevels=
-          '; }
-
-          BLOCK=boot;
-          block=boot;
-          IS_SLOT_DEVICE=1;
-          is_slot_device=1;
-          RAMDISK_COMPRESSION=auto;
-          ramdisk_compression=auto;
-          PATCH_VBMETA_FLAG=auto;
-          patch_vbmeta_flag=auto;
-
-          . tools/ak3-core.sh;
-
-          split_boot;
-          flash_boot;
-          AKEOF
-          sed -i 's/^[[:space:]]*//' ak3_work/anykernel.sh
-          cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
-          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
-          (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
-          unzip -l "${ZIP_NAME}"
-          if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
-            echo "ERROR: Forbidden raw Image/dtb/dtbo.img in ${ZIP_NAME}" >&2
-            exit 1
-          fi
-          sha256sum "${ZIP_NAME}" > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3_work
+            rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
+            cat > ak3_work/anykernel.sh << 'AKEOF'
+            ### AnyKernel3 Ramdisk Mod Script
+            properties() { '
+            kernel.string=N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready, No SUSFS) for pipa
+            do.devicecheck=1
+            do.modules=0
+            do.systemless=1
+            do.cleanup=1
+            do.cleanuponabort=0
+            device.name1=pipa
+            supported.versions=13-16
+            supported.patchlevels=
+            '; }
+  
+            BLOCK=boot;
+            block=boot;
+            IS_SLOT_DEVICE=1;
+            is_slot_device=1;
+            RAMDISK_COMPRESSION=auto;
+            ramdisk_compression=auto;
+            PATCH_VBMETA_FLAG=auto;
+            patch_vbmeta_flag=auto;
+  
+            . tools/ak3-core.sh;
+  
+            split_boot;
+            flash_boot;
+            AKEOF
+            sed -i 's/^[[:space:]]*//' ak3_work/anykernel.sh
+            cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
+            ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
+            (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
+            unzip -l "${ZIP_NAME}"
+            if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
+              echo "ERROR: Forbidden raw Image/dtb/dtbo.img in ${ZIP_NAME}" >&2
+              exit 1
+            fi
+            sha256sum "${ZIP_NAME}" > SHA256SUMS.txt
+            cat SHA256SUMS.txt
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
