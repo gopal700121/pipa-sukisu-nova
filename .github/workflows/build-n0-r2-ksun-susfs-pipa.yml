@@ -129,6 +129,30 @@ jobs:
                   defcfg += f"\n{opt}\n"
           open(defcfg_path, "w").write(defcfg)
           print("[PASS] Updated vendor/pipa_defconfig:", opts)
+
+          # 7. Restore stock Linux 4.19 8-byte kallsyms_markers (unsigned long / PTR) for KPatch-Next kptools
+          sk_path = "scripts/kallsyms.c"
+          sk = open(sk_path).read()
+          m_idx = sk.find('output_label("kallsyms_markers")')
+          assert m_idx != -1, "output_label(kallsyms_markers) not found in scripts/kallsyms.c"
+          print("=== scripts/kallsyms.c kallsyms_markers BEFORE ===")
+          print(sk[m_idx:m_idx+300])
+          sk_tail = sk[m_idx:]
+          sk_tail_new = sk_tail.replace('\\t.long\\t%d\\n', '\\tPTR\\t%d\\n', 1).replace('\\t.long\\t%u\\n', '\\tPTR\\t%u\\n', 1)
+          if sk_tail_new != sk_tail:
+              open(sk_path, "w").write(sk[:m_idx] + sk_tail_new)
+              print("[PASS] Patched scripts/kallsyms.c kallsyms_markers to PTR (8-byte on arm64)")
+          else:
+              print("[INFO] scripts/kallsyms.c kallsyms_markers already uses PTR or different format")
+
+          kk_path = "kernel/kallsyms.c"
+          kk = open(kk_path).read()
+          kk_new = re.sub(r'\b(const\s+)(?:unsigned\s+int|u32)(\s+kallsyms_markers\s*\[)', r'\1unsigned long\2', kk)
+          if kk_new != kk:
+              open(kk_path, "w").write(kk_new)
+              print("[PASS] Patched kernel/kallsyms.c kallsyms_markers to unsigned long")
+          else:
+              print("[INFO] kernel/kallsyms.c kallsyms_markers:", [l for l in kk.splitlines() if "kallsyms_markers" in l][:3])
           PYEOF
 
       - name: Static validation gate (Zero SUSFS + KSUN 4.19 ABI match)
@@ -182,7 +206,7 @@ jobs:
           cd kernel
           MAKE_ARGS="O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make -j"$(nproc)" $MAKE_ARGS vendor/pipa_defconfig
-          scripts/config --file out/.config --set-str LOCALVERSION "-r2-ksun-kpm"
+          scripts/config --file out/.config --set-str LOCALVERSION "-r2-ksun-kpm2"
           scripts/config --file out/.config \
             -e KSU \
             -e KALLSYMS \
@@ -232,7 +256,7 @@ jobs:
           set -euo pipefail
           if [[ "${{ github.event.inputs.repack_only }}" == "true" ]]; then
             mkdir -p kernel/out/arch/arm64/boot
-            gh release download r2-ksun-kpm-v1 -p '*.zip' -D /tmp/old_ak3 --clobber
+            gh release download r2-ksun-kpm-v2 -p '*.zip' -D /tmp/old_ak3 --clobber
             unzip -j /tmp/old_ak3/*.zip Image.gz -d kernel/out/arch/arm64/boot/
             ls -lh kernel/out/arch/arm64/boot/Image.gz
           fi
@@ -267,7 +291,7 @@ jobs:
             "flash_boot;" > ak3_work/anykernel.sh
           cat ak3_work/anykernel.sh
           cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
-          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
+          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-v2-noSUSFS-pipa-AnyKernel3.zip"
           (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
           unzip -l "${ZIP_NAME}"
           if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
@@ -283,19 +307,19 @@ jobs:
           name: n0kernel-r2-ksun-kpm-nosusfs-pipa
           if-no-files-found: ignore
           path: |
-            N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip
+            N0Kernel-r2-KSUN-v3.1.0-KPM-v2-noSUSFS-pipa-AnyKernel3.zip
             SHA256SUMS.txt
             abi-gate.txt
             config-audit.txt
 
-      - name: Publish GitHub Release (r2-ksun-kpm-v1)
+      - name: Publish GitHub Release (r2-ksun-kpm-v2)
         if: ${{ github.event.inputs.publish_release != 'false' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          TAG="r2-ksun-kpm-v1"
-          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
+          TAG="r2-ksun-kpm-v2"
+          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-v2-noSUSFS-pipa-AnyKernel3.zip"
           R1_C="${R1_COMMIT:-e6708914262c72b3e7eea0433ee5c33b9029e32f}"
           K_TAG="${KSUN_TAG:-v3.1.0-legacy}"
           K_C="${KSUN_COMMIT:-1ce19e536de730829b62d0d23dbd96c6ec809e2f}"
@@ -307,7 +331,7 @@ jobs:
             "- **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_C}\`)" \
             "- **KernelSU-Next:** \`${K_TAG}\` (\`${K_C}\`)" \
             "- **SUSFS:** Completely removed (zero SUSFS files, headers, patches, or config flags)" \
-            "- **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, \`CONFIG_LTO_NONE=y\` (\`LOCALVERSION=-r2-ksun-kpm\`)" \
+            "- **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, \`CONFIG_LTO_NONE=y\` (\`LOCALVERSION=-r2-ksun-kpm2\`)" \
             "- **Toolchain:** Google AOSP Clang \`${CL_R}\`" \
             "- **Packaging:** \`Image.gz\`-only AnyKernel3 (\`BLOCK=boot\`, \`IS_SLOT_DEVICE=1\`, \`split_boot; flash_boot;\`)" \
             "" \
