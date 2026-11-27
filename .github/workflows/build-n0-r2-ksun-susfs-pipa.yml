@@ -32,40 +32,25 @@ jobs:
           rm -rf KernelSU KernelSU-Next drivers/kernelsu
           git status -s
 
-      - name: Integrate KernelSU-Next (v3.1.0-legacy-susfs) & SUSFS v2.x 4.19 backport
+      - name: Integrate single-source KSUN v3.1.0-legacy + SUSFS v2.1.0 (wagamy tag)
         run: |
           set -euo pipefail
           WORK_DIR="$(pwd)"
           cd kernel
 
-          # Clone JackA1ltman/NonGKI_Kernel_Build_2nd for 4.19 SUSFS v2.x backport (simonpunk kernel-4.19 is v1.5.x only)
-          git clone --depth=1 https://github.com/JackA1ltman/NonGKI_Kernel_Build_2nd.git "$WORK_DIR/nongki"
-          SUSFS_COMMIT="$(git -C "$WORK_DIR/nongki" rev-parse HEAD)"
-          echo "SUSFS_COMMIT=${SUSFS_COMMIT}" >> "$GITHUB_ENV"
-          echo "NonGKI_Kernel_Build_2nd commit: ${SUSFS_COMMIT}"
-          ls -la "$WORK_DIR/nongki/Patches" "$WORK_DIR/nongki/Patches/Patch" || true
+          # Clone wagamy reference repo (lineage-23.2 clean base + ksun_v3.1.0-susfs_v2.1.0 tag)
+          git clone --depth=1 --branch ksun_v3.1.0-susfs_v2.1.0 https://github.com/wagamy/android_kernel_oneplus_sm8250.git "$WORK_DIR/wagamy"
+          git -C "$WORK_DIR/wagamy" fetch --depth=1 origin lineage-23.2:refs/remotes/origin/lineage-23.2
+          WAGAMY_COMMIT="$(git -C "$WORK_DIR/wagamy" rev-parse HEAD)"
+          echo "SUSFS_COMMIT=${WAGAMY_COMMIT}" >> "$GITHUB_ENV"
+          echo "KSUN_COMMIT=${WAGAMY_COMMIT}" >> "$GITHUB_ENV"
+          echo "CHOSEN_KSUN_TAG=v3.1.0-legacy-susfs@wagamy-${WAGAMY_COMMIT:0:8}" >> "$GITHUB_ENV"
+          echo "wagamy ksun_v3.1.0-susfs_v2.1.0 commit: ${WAGAMY_COMMIT}"
 
-          # Fetch exact pinned KernelSU-Next v3.1.0-legacy-susfs commit from fnxln/kernel_xiaomi_ginkgo_ksu
-          git clone --depth=1 --branch ginkgo-susfs --filter=blob:none --no-checkout https://github.com/fnxln/kernel_xiaomi_ginkgo_ksu.git "$WORK_DIR/fnxln_ref"
-          git -C "$WORK_DIR/fnxln_ref" checkout HEAD -- .gitmodules
-          GM_URL="$(git -C "$WORK_DIR/fnxln_ref" config -f .gitmodules --get submodule.KernelSU-Next.url || true)"
-          GM_SHA="$(git -C "$WORK_DIR/fnxln_ref" ls-tree HEAD KernelSU-Next | awk '{print $3}' || true)"
-          echo "fnxln submodule URL: ${GM_URL:-<none>}, SHA: ${GM_SHA:-<none>}"
-
+          # 1) Wholesale copy of device-independent KernelSU-Next/kernel/ + SUSFS v2.1.0 core files ONLY
           rm -rf KernelSU-Next drivers/kernelsu
           mkdir -p KernelSU-Next
-          git -C KernelSU-Next init -q
-          git -C KernelSU-Next remote add origin "${GM_URL}"
-          git -C KernelSU-Next fetch --depth=1 origin "${GM_SHA}"
-          git -C KernelSU-Next checkout -q FETCH_HEAD
-
-          KSUN_COMMIT="$(git -C KernelSU-Next rev-parse HEAD)"
-          echo "CHOSEN_KSUN_TAG=v3.1.0-legacy-susfs@${GM_SHA:0:7}" >> "$GITHUB_ENV"
-          echo "KSUN_REPO=${GM_URL}" >> "$GITHUB_ENV"
-          echo "KSUN_COMMIT=${KSUN_COMMIT}" >> "$GITHUB_ENV"
-          echo "Selected KernelSU-Next: ${GM_URL} @ ${KSUN_COMMIT}"
-          git -C KernelSU-Next log -1 --oneline || true
-
+          cp -r "$WORK_DIR/wagamy/KernelSU-Next/kernel" KernelSU-Next/kernel
           ln -s ../KernelSU-Next/kernel drivers/kernelsu
           if ! grep -q 'drivers/kernelsu/Kconfig' drivers/Kconfig; then
             sed -i '/endmenu/i source "drivers/kernelsu/Kconfig"' drivers/Kconfig
@@ -74,31 +59,28 @@ jobs:
             echo 'obj-$(CONFIG_KSU) += kernelsu/' >> drivers/Makefile
           fi
 
-          # Locate and apply 4.19 SUSFS v2.x patch & source files from NonGKI_Kernel_Build_2nd
-          SUS_PATCH="$(find "$WORK_DIR/nongki" -type f -name '*4.19*.patch' | head -n 1 || true)"
-          echo "Found 4.19 SUSFS patch: ${SUS_PATCH:-<none>}"
-          # Copy susfs.c / susfs.h / susfs_def.h if shipped outside the patch
-          for F in susfs.c; do
-            SRC="$(find "$WORK_DIR/nongki" -type f -name "$F" | head -n 1 || true)"
-            [[ -n "$SRC" ]] && cp "$SRC" fs/
-          done
-          for F in susfs.h susfs_def.h; do
-            SRC="$(find "$WORK_DIR/nongki" -type f -name "$F" | head -n 1 || true)"
-            [[ -n "$SRC" ]] && cp "$SRC" include/linux/
-          done
-          if [[ -n "$SUS_PATCH" ]]; then
-            echo ">>> Applying ${SUS_PATCH}"
-            set +e
-            patch -p1 --fuzz=3 --forward < "$SUS_PATCH"
-            PATCH_RC=$?
-            set -e
-            echo "SUSFS 4.19 patch exit code: ${PATCH_RC}"
-          else
-            echo "ERROR: No 4.19 SUSFS patch found in NonGKI_Kernel_Build_2nd" >&2
-            find "$WORK_DIR/nongki" -maxdepth 4 -print
-            exit 1
-          fi
-          grep -E 'SUSFS_VERSION|SUSFS_MAGIC' include/linux/susfs*.h || true
+          cp "$WORK_DIR/wagamy/fs/susfs.c" fs/susfs.c
+          cp "$WORK_DIR/wagamy/include/linux/susfs.h" include/linux/susfs.h
+          cp "$WORK_DIR/wagamy/include/linux/susfs_def.h" include/linux/susfs_def.h
+          grep -E 'SUSFS_VERSION|SUSFS_MAGIC|TIF_PROC_UMOUNTED' include/linux/susfs*.h || true
+
+          # 2) Extract pure generic SUSFS/KSU hook diff from wagamy (NEVER arch/, DTS, or OnePlus drivers)
+          HOOK_FILES=(
+            fs/Makefile fs/namespace.c fs/readdir.c fs/statfs.c fs/namei.c fs/super.c
+            fs/internal.h fs/mount.h fs/notify/fdinfo.c fs/proc/base.c fs/proc/cmdline.c
+            fs/proc/fd.c fs/proc/task_mmu.c fs/proc_namespace.c
+            kernel/kallsyms.c security/selinux/avc.c
+            include/linux/seccomp.h include/linux/sched.h include/linux/mount.h
+          )
+          git -C "$WORK_DIR/wagamy" diff origin/lineage-23.2..HEAD -- "${HOOK_FILES[@]}" > "$WORK_DIR/wagamy-susfs-v2.1.0-hooks.patch"
+          echo "=== Files in wagamy-susfs-v2.1.0-hooks.patch ==="
+          grep '^diff --git' "$WORK_DIR/wagamy-susfs-v2.1.0-hooks.patch" || true
+
+          set +e
+          patch -p1 --fuzz=3 --forward < "$WORK_DIR/wagamy-susfs-v2.1.0-hooks.patch"
+          PATCH_RC=$?
+          set -e
+          echo "wagamy-susfs-v2.1.0-hooks.patch exit code: ${PATCH_RC}"
           find . -maxdepth 5 -name '*.rej' -print
 
       - name: Reconcile known 4.19 SUSFS rejects & wire/verify KSUN manual hooks
@@ -108,11 +90,11 @@ jobs:
           python3 ../scripts/reconcile_ksun_susfs.py
       
 
-      - name: Run blocking pre-build ABI & Hook Gate (scripts/ksu_abi_gate.sh)
+      - name: Run blocking pre-build ABI & Hook Gate (ksu_abi_gate.sh + gate-run12.sh)
         run: |
-          chmod +x scripts/ksu_abi_gate.sh
+          chmod +x scripts/ksu_abi_gate.sh scripts/gate-run12.sh
           ./scripts/ksu_abi_gate.sh kernel | tee abi-gate.txt
-
+          (cd kernel && bash ../scripts/gate-run12.sh) | tee -a abi-gate.txt
       - name: Free disk space & install build dependencies
         run: |
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /usr/local/share/boost
