@@ -169,7 +169,7 @@ jobs:
         run: |
           set -euo pipefail
           cd kernel
-          MAKE_ARGS="O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
+          MAKE_ARGS="O=out ARCH=arm64 CC=clang LLVM=1 LLVM_IAS=1 LD=ld.lld AR=llvm-ar NM=llvm-nm OBJCOPY=llvm-objcopy OBJDUMP=llvm-objdump STRIP=llvm-strip CROSS_COMPILE=aarch64-linux-gnu- CROSS_COMPILE_ARM32=arm-linux-gnueabi-"
           make -j"$(nproc)" $MAKE_ARGS vendor/pipa_defconfig
           scripts/config --file out/.config --set-str LOCALVERSION "-r2-ksun-kpm"
           scripts/config --file out/.config \
@@ -177,6 +177,7 @@ jobs:
             -e KALLSYMS \
             -e KALLSYMS_ALL \
             -d TRIM_UNUSED_KSYMS \
+            -e LTO_NONE \
             -d LTO \
             -d LTO_CLANG \
             -d LTO_CLANG_THIN \
@@ -191,6 +192,8 @@ jobs:
           grep -q '^CONFIG_KALLSYMS=y$' out/.config
           grep -q '^CONFIG_KALLSYMS_ALL=y$' out/.config
           ! grep -q '^CONFIG_LTO_CLANG_THIN=y$' out/.config
+          ! grep -q '^CONFIG_LTO=y$' out/.config
+          ! grep -q '^CONFIG_LTO_CLANG=y$' out/.config
           ! grep -qE '^CONFIG_.*SUSFS.*=y$' out/.config
           make -j"$(nproc)" $MAKE_ARGS Image.gz 2>&1 | tee ../build.log
           test -s out/arch/arm64/boot/Image.gz
