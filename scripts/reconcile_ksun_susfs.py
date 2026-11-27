@@ -28,22 +28,31 @@ if os.path.exists("fs/proc/task_mmu.c.rej"):
     txt = open("fs/proc/task_mmu.c").read()
     if "#include <linux/susfs_def.h>" not in txt:
         txt = "#include <linux/susfs_def.h>\n" + txt
+    if "AS_FLAGS_SUS_MAP" in txt:
+        sus_cond = "unlikely(test_bit(AS_FLAGS_SUS_MAP, &inode->i_mapping->flags)) && susfs_is_current_proc_umounted()"
+    elif "BIT_SUS_MAP" in txt:
+        sus_cond = "unlikely(inode->i_mapping->flags & BIT_SUS_MAP) && susfs_is_current_proc_umounted()"
+    else:
+        sus_cond = "0"
+    print(">>> Detected SUS_MAP condition in task_mmu.c:", sus_cond)
     target = "ret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);"
     if target in txt:
         replacement = (
             "#ifdef CONFIG_KSU_SUSFS_SUS_MAP\n"
-            "\t\t\tstruct vm_area_struct *vma = find_vma(mm, start_vaddr);\n"
-            "\t\t\tif (vma && vma->vm_file) {\n"
-            "\t\t\t\tstruct inode *inode = file_inode(vma->vm_file);\n"
-            "\t\t\t\tif (unlikely(inode->i_mapping->flags & BIT_SUS_MAPS) && susfs_is_current_proc_umounted()) {\n"
-            "\t\t\t\t\tmemset(pm.buffer, 0, sizeof(pagemap_entry_t) * pm.len);\n"
-            "\t\t\t\t\tpm.pos = pm.len;\n"
-            "\t\t\t\t\tret = 0;\n"
+            "\t\t\t{\n"
+            "\t\t\t\tstruct vm_area_struct *vma = find_vma(mm, start_vaddr);\n"
+            "\t\t\t\tif (vma && vma->vm_file) {\n"
+            "\t\t\t\t\tstruct inode *inode = file_inode(vma->vm_file);\n"
+            f"\t\t\t\t\tif ({sus_cond}) {{\n"
+            "\t\t\t\t\t\tmemset(pm.buffer, 0, sizeof(pagemap_entry_t) * pm.len);\n"
+            "\t\t\t\t\t\tpm.pos = pm.len;\n"
+            "\t\t\t\t\t\tret = 0;\n"
+            "\t\t\t\t\t} else {\n"
+            "\t\t\t\t\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
+            "\t\t\t\t\t}\n"
             "\t\t\t\t} else {\n"
             "\t\t\t\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
             "\t\t\t\t}\n"
-            "\t\t\t} else {\n"
-            "\t\t\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
             "\t\t\t}\n"
             "#else\n"
             "\t\t\tret = walk_page_range(mm, start_vaddr, end, &pagemap_ops, &pm);\n"
