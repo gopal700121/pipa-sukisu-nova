@@ -236,53 +236,52 @@ jobs:
             unzip -j /tmp/old_ak3/*.zip Image.gz -d kernel/out/arch/arm64/boot/
             ls -lh kernel/out/arch/arm64/boot/Image.gz
           fi
-            git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3_work
-            rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
-            cat > ak3_work/anykernel.sh << 'AKEOF'
-            ### AnyKernel3 Ramdisk Mod Script
-            properties() { '
-            kernel.string=N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready, No SUSFS) for pipa
-            do.devicecheck=1
-            do.modules=0
-            do.systemless=1
-            do.cleanup=1
-            do.cleanuponabort=0
-            device.name1=pipa
-            supported.versions=13-16
-            supported.patchlevels=
-            '; }
-  
-            BLOCK=boot;
-            block=boot;
-            IS_SLOT_DEVICE=1;
-            is_slot_device=1;
-            RAMDISK_COMPRESSION=auto;
-            ramdisk_compression=auto;
-            PATCH_VBMETA_FLAG=auto;
-            patch_vbmeta_flag=auto;
-  
-            . tools/ak3-core.sh;
-  
-            split_boot;
-            flash_boot;
-            AKEOF
-            sed -i 's/^[[:space:]]*//' ak3_work/anykernel.sh
-            cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
-            ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
-            (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
-            unzip -l "${ZIP_NAME}"
-            if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
-              echo "ERROR: Forbidden raw Image/dtb/dtbo.img in ${ZIP_NAME}" >&2
-              exit 1
-            fi
-            sha256sum "${ZIP_NAME}" > SHA256SUMS.txt
-            cat SHA256SUMS.txt
+          git clone --depth=1 https://github.com/osm0sis/AnyKernel3.git ak3_work
+          rm -rf ak3_work/.git ak3_work/modules ak3_work/patch ak3_work/ramdisk ak3_work/README.md
+          printf '%s\n' \
+            "### AnyKernel3 Ramdisk Mod Script" \
+            "properties() { '" \
+            "kernel.string=N0Kernel r2 (KSUN v3.1.0-legacy + KPM-ready, No SUSFS) for pipa" \
+            "do.devicecheck=1" \
+            "do.modules=0" \
+            "do.systemless=1" \
+            "do.cleanup=1" \
+            "do.cleanuponabort=0" \
+            "device.name1=pipa" \
+            "supported.versions=13-16" \
+            "supported.patchlevels=" \
+            "'; }" \
+            "" \
+            "BLOCK=boot;" \
+            "block=boot;" \
+            "IS_SLOT_DEVICE=1;" \
+            "is_slot_device=1;" \
+            "RAMDISK_COMPRESSION=auto;" \
+            "ramdisk_compression=auto;" \
+            "PATCH_VBMETA_FLAG=auto;" \
+            "patch_vbmeta_flag=auto;" \
+            "" \
+            ". tools/ak3-core.sh;" \
+            "" \
+            "split_boot;" \
+            "flash_boot;" > ak3_work/anykernel.sh
+          cat ak3_work/anykernel.sh
+          cp kernel/out/arch/arm64/boot/Image.gz ak3_work/Image.gz
+          ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
+          (cd ak3_work && zip -r9 "../${ZIP_NAME}" * -x '*.git*')
+          unzip -l "${ZIP_NAME}"
+          if unzip -l "${ZIP_NAME}" | awk '{print $4}' | grep -Eq '^(Image|dtb|dtbo\.img)$'; then
+            echo "ERROR: Forbidden raw Image/dtb/dtbo.img in ${ZIP_NAME}" >&2
+            exit 1
+          fi
+          sha256sum "${ZIP_NAME}" > SHA256SUMS.txt
+          cat SHA256SUMS.txt
 
       - name: Upload build artifacts
         uses: actions/upload-artifact@v4
         with:
-          if-no-files-found: ignore
           name: n0kernel-r2-ksun-kpm-nosusfs-pipa
+          if-no-files-found: ignore
           path: |
             N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip
             SHA256SUMS.txt
@@ -297,22 +296,25 @@ jobs:
           set -euo pipefail
           TAG="r2-ksun-kpm-v1"
           ZIP_NAME="N0Kernel-r2-KSUN-v3.1.0-KPM-noSUSFS-pipa-AnyKernel3.zip"
-          cat > release-notes.md << EOF
-          ## N0Kernel r2 — KernelSU-Next ${KSUN_TAG:-v3.1.0-legacy} + KPM-ready (Zero SUSFS) for Xiaomi Pad 6 (pipa)
-
-          - **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_COMMIT}:-e6708914262c72b3e7eea0433ee5c33b9029e32f\`)
-          - **KernelSU-Next:** \`${KSUN_TAG:-v3.1.0-legacy}\` (\`${KSUN_COMMIT:-1ce19e536de730829b62d0d23dbd96c6ec809e2f}\`)
-          - **SUSFS:** Completely removed (zero SUSFS files, headers, patches, or config flags)
-          - **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, ThinLTO OFF (\`LOCALVERSION=-r2-ksun-kpm\`)
-          - **Toolchain:** Google AOSP Clang \`${CLANG_REV:-clang-r522817}\`
-          - **Packaging:** \`Image.gz\`-only AnyKernel3 (\`is_slot_device=1\`, \`split_boot; flash_boot;\`)
-
-          ### SHA-256 Checksum
-          \`\`\`
-          $(cat SHA256SUMS.txt)
-          \`\`\`
-          EOF
-          sed -i 's/^[[:space:]]*//' release-notes.md
+          R1_C="${R1_COMMIT:-e6708914262c72b3e7eea0433ee5c33b9029e32f}"
+          K_TAG="${KSUN_TAG:-v3.1.0-legacy}"
+          K_C="${KSUN_COMMIT:-1ce19e536de730829b62d0d23dbd96c6ec809e2f}"
+          CL_R="${CLANG_REV:-clang-r522817}"
+          SHA_LINE="$(cat SHA256SUMS.txt)"
+          printf '%s\n' \
+            "## N0Kernel r2 — KernelSU-Next ${K_TAG} + KPM-ready (Zero SUSFS) for Xiaomi Pad 6 (pipa)" \
+            "" \
+            "- **Base:** CuriousNom/n0_kernel_pipa \`r1\` (\`${R1_C}\`)" \
+            "- **KernelSU-Next:** \`${K_TAG}\` (\`${K_C}\`)" \
+            "- **SUSFS:** Completely removed (zero SUSFS files, headers, patches, or config flags)" \
+            "- **KPM Readiness:** \`CONFIG_KALLSYMS=y\`, \`CONFIG_KALLSYMS_ALL=y\`, \`CONFIG_TRIM_UNUSED_KSYMS=n\`, \`CONFIG_LTO_NONE=y\` (\`LOCALVERSION=-r2-ksun-kpm\`)" \
+            "- **Toolchain:** Google AOSP Clang \`${CL_R}\`" \
+            "- **Packaging:** \`Image.gz\`-only AnyKernel3 (\`BLOCK=boot\`, \`IS_SLOT_DEVICE=1\`, \`split_boot; flash_boot;\`)" \
+            "" \
+            "### SHA-256 Checksum" \
+            '```' \
+            "${SHA_LINE}" \
+            '```' > release-notes.md
           if gh release view "$TAG" >/dev/null 2>&1; then
             gh release upload "$TAG" "${ZIP_NAME}" SHA256SUMS.txt --clobber
             gh release edit "$TAG" --notes-file release-notes.md
@@ -321,3 +323,4 @@ jobs:
               --title "N0Kernel r2 — KSUN v3.1.0-legacy + KPM-ready (No SUSFS, pipa)" \
               --notes-file release-notes.md
           fi
+          
